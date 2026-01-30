@@ -1,6 +1,7 @@
 import time
 import random
 import json
+import os
 from playwright.sync_api import sync_playwright
 from config import BASE_URL, HEADLESS, DELAY_RANGE
 
@@ -10,7 +11,8 @@ class NMPAScraper:
         self.context = None
         self.page = None
         self.intercepted_data = []
-        # Store existing records as a set of tuples (license_number, enterprise_name)
+        self.playwright = None
+        # Set of (licenseNum, entName) already in DB to avoid dupes
         self.existing_records = existing_records or set()
 
     def start(self):
@@ -19,7 +21,6 @@ class NMPAScraper:
         print("[Scraper] Connecting to YOUR manually opened Chrome (Port 9222)...")
         try:
             # Connect to the Chrome instance launched by the user
-            # This is the "God Mode" for bypassing anti-bot 
             self.browser = self.playwright.chromium.connect_over_cdp("http://localhost:9222")
             self.context = self.browser.contexts[0]
             
@@ -29,7 +30,7 @@ class NMPAScraper:
             else:
                 self.page = self.context.new_page()
                 
-            print("[Scraper] Connected successfully! logic will now run on your open window.")
+            print("[Scraper] Connected successfully! Logic will now run on your open window.")
             
         except Exception as e:
             print(f"[Error] Could not connect to Chrome on port 9222.")
@@ -41,14 +42,10 @@ class NMPAScraper:
     def handle_response(self, response):
         """Intercept network responses to find data JSONs."""
         try:
-            # Debug: Log all JSON responses to find the right one
             if 'application/json' in response.headers.get('content-type', ''):
-                url = response.url
-                # Loose filter: Catch anything that looks like a search result
-                if 'datasearch' in url or 'search' in url or 'query' in url or 'get' in url:
+                if '/datasearch/' in response.url:
                     try:
                         data = response.json()
-                        # Check if it looks like a list
                         if isinstance(data, dict) or isinstance(data, list):
                              self.intercepted_data.append(data)
                     except:
@@ -56,251 +53,249 @@ class NMPAScraper:
         except Exception:
             pass
 
-    def search(self, keyword="医疗", max_pages=5):
+    def search(self, keyword="上海", max_pages=5):
+        """Main search entry point with tab-syncing and fallback search logic."""
         try:
-            print(f"[Scraper] Loading page {BASE_URL}...")
-            self.page.on("response", self.handle_response)
+            # 1. SCAN FOR EXISTING RESULT TAB (User-first approach)
+            print("[Scraper] Scanning open tabs for 'search-result.html'...")
+            existing_target = None
+            for p in self.context.pages:
+                if "search-result.html" in p.url:
+                    existing_target = p
+                    break
             
-            try:
-                self.page.goto(BASE_URL, timeout=60000)
-                self.page.wait_for_load_state("networkidle")
-            except:
-                print("[Scraper] Page load timed out or incomplete. Trying reload...")
-                self.page.reload()
-                self.page.wait_for_load_state("networkidle")
-            
-            # --- Interaction Steps based on User Feedback ---
-            print("[Scraper] specialized check: closing any guide overlays...")
+            if existing_target:
+                self.page = existing_target
+                self.page.bring_to_front()
+                print(f"[Scraper] Found existing result tab: {self.page.url}")
+            else:
+                # 2. FALLBACK: Normal Search Flow
+                print(f"[Scraper] No result tab found. Starting from {BASE_URL}...")
+                self.page.on("response", self.handle_response)
+                
+                try:
+                    self.page.goto(BASE_URL, timeout=60000)
+                    self.page.wait_for_load_state("networkidle")
+                except Exception as e_nav:
+                    print(f"[Scraper] Navigation issue: {e_nav}. Trying reload...")
+                    self.page.reload()
+                
             self._close_overlays()
             time.sleep(1)
-            
-            print("[Scraper] Interacting with search bar...")
-            time.sleep(1)
-            
-            # 1. Click the category DIRECTLY (User suggestion)
-            # resolving Strict Mode by picking the visible one or the specific link class
+            # Select Category (User Request: Auto-Select)
+            category_target = "医疗器械经营企业（备案）"
             try:
-                print("[Scraper] Clicking direct link '医疗器械经营企业（备案）'...")
-                # The user pointed out a direct link below the search bar.
-                # We use .first to avoid strict mode error if multiple exist (dropdown + list)
-                # We also force a wait for it to be visible
-                link = self.page.get_by_text("医疗器械经营企业（备案）").last # The list item is usually later in DOM than the dropdown
-                # If .last doesn't work, we can try iterating or generic click
-                if link.count() > 1:
-                     print(f"[Debug] Found {link.count()} elements, clicking the last one (likely the list item)...")
-                     link.last.click()
+                # 1. First, check if the category tag is ALREADY active (Best visual confirmation)
+                # The screenshot shows the tag below the search bar even if the dropdown says "请选择"
+                tag_exists = self.page.locator(f".el-tag:has-text('{category_target}')").count() > 0
+                
+                if tag_exists:
+                        print(f"[Scraper] Found active category tag '{category_target}'. Skipping selection.")
                 else:
-                     link.click()
-                
-                print("[Scraper] Category selected via direct link.")
-                time.sleep(1)
-                
-                # 2. Input Search Keyword (REQUIRED)
-                # 2. Input Search Keyword (REQUIRED)
+                    print(f"[Scraper] Tag missing. Checking dropdown value...")
+                    # 2. Check current value via JS (targeting the 'Select' input we identified as Input #0)
+                    current_cat = self.page.evaluate("""() => {
+                        const i = document.querySelector('input[placeholder="请选择"]'); 
+                        return i ? i.value : '';
+                    }""")
+                    
+                    if category_target not in current_cat:
+                        print(f"[Scraper] Category mismatch. actively selecting '{category_target}'...")
+                        self.page.click('input[placeholder="请选择"]', timeout=3000)
+                        time.sleep(1)
+                        # Wait and Click the option
+                        # Use locator with visible=True to avoid clicking hidden dropdowns
+                        self.page.locator(f".el-select-dropdown__item:has-text('{category_target}')").filter(has=self.page.locator(":visible")).first.click(timeout=5000)
+                        time.sleep(1)
+                    else:
+                        print(f"[Scraper] Category dropdown already set to '{current_cat}'. Skipping.")
+            except Exception as e_cat:
+                print(f"[Warning] Category selection failed: {e_cat}")
+
+            # Fill Keyword (Strict Validation Loop)
+            try:
                 print(f"[Scraper] Inputting keyword '{keyword}'...")
-                search_input = None
-                try:
-                    # Strategy A: Known placeholders
-                    candidates = ["企业名称", "关键词", "输入", "名称", "注册证号"]
-                    for ph in candidates:
-                        loc = self.page.locator(f"input[placeholder*='{ph}']").first
-                        if loc.is_visible():
-                            try:
-                                if loc.is_editable():
-                                    search_input = loc
-                                    print(f"[Debug] Found search input by placeholder: '{ph}'")
-                                    break
-                            except: pass
-
-                    # Strategy B: Any editable textbox
-                    if not search_input:
-                        print("[Debug] Placeholder match failed. Checking all textboxes...")
-                        textboxes = self.page.get_by_role("textbox").all()
-                        for i, box in enumerate(textboxes):
-                            if box.is_visible() and box.is_editable():
-                                # Exclude the readonly one (often the category selector)
-                                if not box.get_attribute("readonly"):
-                                    search_input = box
-                                    print(f"[Debug] Found generic editable input #{i}")
-                                    break
-                    
-                    if search_input:
-                        search_input.fill(keyword)
-                    else:
-                        print(f"[Scraper] WARNING: Could not auto-focus search bar. Please manually type '{keyword}'!")
-                except Exception as e:
-                    print(f"[Scraper] Input interaction failed: {e}")
+                search_success = False
                 
-                # 3. Click Search Button (SINGLE RELIABLE TRIGGER)
-                print("[Scraper] Triggering Search (Click Strategy)...")
-                
-                # Snapshot current state
-                initial_page_count = len(self.context.pages)
-                search_triggered = False
-                
-                try:
-                    # Find and click the button
-                    search_btns = [
-                        self.page.locator("button").filter(has_text="查询").first,
-                        self.page.get_by_role("button", name="查询").first,
-                        self.page.locator(".el-icon-search").locator("..").first 
-                    ]
-                    
-                    btn_to_click = None
-                    for btn in search_btns:
-                        if btn.count() > 0 and btn.is_visible():
-                            btn_to_click = btn
-                            break
-                    
-                    if btn_to_click:
-                        print(f"[Debug] Clicking search button: {btn_to_click}")
+                for attempt in range(3):
+                    # JS Strategy: Find input, wipe it, set it, dispatch events
+                    # This bypasses any "element not interactable" or focus issues
+                    js_success = self.page.evaluate(f"""(kw) => {{
+                        // Try multiple ways to find the MAIN search input
+                        const inputs = Array.from(document.querySelectorAll('input'));
+                        // Filter for visible text inputs that look like the main search bar AND ARE NOT READONLY
+                        const target = inputs.find(i => {{
+                            const style = window.getComputedStyle(i);
+                            return style.display !== 'none' && 
+                                    style.visibility !== 'hidden' && 
+                                    i.type === 'text' && 
+                                    !i.readOnly && // CRITICAL FIX: Ignore the 'Select' dropdown
+                                    (i.placeholder.includes('企业名称') || i.className.includes('el-input__inner')) &&
+                                    i.clientWidth > 100; 
+                        }});
                         
-                        # USE ROBUST WAY TO CATCH NEW PAGE
-                        try:
-                            with self.context.expect_page(timeout=10000) as new_page_info:
-                                btn_to_click.click()
+                        if (target) {{
+                            target.focus();
+                            target.value = ''; // Wipe
+                            target.value = kw; // Set
                             
-                            # Sync API: new_page_info.value IS the page object
-                            target_page = new_page_info.value
-                            print(f"[Scraper] New window captured via expect_page: {target_page.url}")
-                            search_triggered = True
-                        except Exception as e_timeout:
-                            print(f"[Warning] expect_page timed out: {e_timeout}. Checking manually...")
-                            # Fallback: Check if page count increased anyway
-                            btn_to_click.click() # Ensure it was clicked
-                            time.sleep(3)
+                            // CJK Event Sequence for Element UI / Vue
+                            target.dispatchEvent(new Event('compositionstart', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('compositionend', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            
+                            return true;
+                        }}
+                        return false;
+                    }}""", keyword)
+                    
+                    if js_success:
+                        print(f"[Scraper] JS injected '{keyword}'. Verifying...")
+                        time.sleep(1)
+                        # Verify value
+                        actual_val = self.page.evaluate("""() => {
+                            // Specific verification: Only verify the input with '企业名称' placeholder to avoid reading the dropdown
+                            const i = document.querySelector('input[placeholder*="企业名称"]');
+                            return i ? i.value : '';
+                        }""")
+                        
+                        if actual_val == keyword:
+                            print(f"[Scraper] Verified input is '{keyword}'. Pressing Enter.")
+                            self.page.keyboard.press("Enter")
+                            search_success = True
+                            break
+                        else:
+                            print(f"[Scraper] Mismatch after JS! Expected '{keyword}', got '{actual_val}'.")
                     else:
-                         print("[Error] No search button found.")
-                            
-                except Exception as e:
-                    print(f"[Scraper] Search trigger failed: {e}") 
-            except Exception as e:
-                print(f"[Scraper] Interaction warning: {e}") 
-            except Exception as e:
-                print(f"[Scraper] Interaction warning: {e}")
-                
-            print("[Scraper] Waiting for results...")
-            time.sleep(5)
-            
-            # --- Result Page Handling ---
-            print("[Scraper] Checking for result page tab...")
-            target_page = None
-            
-            # Wait a moment for tab URL to update
-            time.sleep(2)
-            
-            # Iterate all pages to find the result one
-            for _ in range(10): # retry loop for URL update
-                for i, p in enumerate(self.context.pages):
-                    try:
-                        # print(f"[Debug] Tab {i}: {p.url}")
-                        # Strict check: ONLY accept actual search result pages
-                        if "search-result" in p.url:
-                             target_page = p
-                             print(f"[Scraper] Found Result Page by URL match: {p.url}")
-                             break
-                    except: pass
-                
-                if target_page: break
-                time.sleep(1)
-            
-            # Fallback: If we know a new page opened (count > 1 likely means search+result), use the last one
-            if not target_page and len(self.context.pages) > 1:
-                print(f"[Scraper] Strict URL match failed. Defaulting to the latest tab (Tab {len(self.context.pages)-1}).")
-                target_page = self.context.pages[-1]
+                        print(f"[Scraper] JS could not find input box (Attempt {attempt+1}). Retrying...")
+                        time.sleep(1)
 
-            if target_page:
-                self.page = target_page
-                self.page.bring_to_front()
+                if not search_success:
+                    print(f"[Error] Failed to set search keyword to '{keyword}'. Aborting search for this keyword.")
+                    try: self.page.screenshot(path="debug_search_fail.png")
+                    except: pass
+                    return [] # CRITICAL: STOP if we didn't set the keyword
+                
+                time.sleep(1)
+                
+                # Click Search Button (Magnifier) as backup
                 try:
-                    self.page.wait_for_load_state("domcontentloaded")
-                    print(f"[Scraper] Switched context to: {self.page.url}")
+                    # Search for the button next to the input
+                    self.page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const searchBtn = btns.find(b => b.innerText.includes('查询') || b.querySelector('i.el-icon-search'));
+                        if (searchBtn) searchBtn.click();
+                    }""")
                 except: pass
-            else:
-                 print("[Warning] Could not identify result page. Staying on current page (Risk of 0 rows).")
-            # ------------------------------------------------
-            
+                
+                print("[Scraper] Search trigger sequence completed.")
+            except Exception as e_int:
+                print(f"[Scraper] Interaction sequence failed: {e_int}")
+
+            # Check for "No Data" immediately
+            print("[Scraper] Verifying search results...")
+            try:
+                self.page.wait_for_selector("tr, .el-table__row, .no-data, text='暂无数据'", timeout=8000)
+                if self.page.locator("text='暂无数据内容'").count() > 0 or self.page.locator("text='暂无数据'").count() > 0:
+                     print("[Scraper] Search returned NO DATA. Stopping.")
+                     return []
+            except:
+                pass
+
+            self.page.wait_for_load_state("domcontentloaded")
+            time.sleep(2) # Settle time
+
         except Exception as e:
-            print(f"[Scraper] Initial navigation failed: {e}")
+            print(f"[Scraper] search() method failed: {e}")
             return []
 
-        all_items = []
+        # Yielding results loop (Smart Page Counting)
+        effective_pages = 0
+        total_attempts = 0 # Safety breaker
         
-        for page_num in range(1, max_pages + 1):
-            print(f"[Scraper] Processing Page {page_num}...")
-            
-            # Allow UI to settle (popup might animate in)
+        while effective_pages < max_pages:
+            total_attempts += 1
+            if total_attempts > max_pages * 5: # Prevent infinite loops if site is huge but all dups
+                print("[Scraper] Max safety attempts reached. Stopping.")
+                break
+                
+            print(f"[Scraper] Processing Page {total_attempts} (Effective: {effective_pages}/{max_pages})...")
             time.sleep(2)
-            
-            # 0. Handle Potential Overlays (User reported a popup)
             self._close_overlays()
 
-            # 1. Wait for data to load - Explicit Wait
-            print("[Scraper] Waiting for table rows...")
+            # Wait for data table
             try:
                 self.page.wait_for_selector("tr, .el-table__row", timeout=15000)
             except:
-                print("[Scraper] Wait for rows timed out. Page might be empty or loading slowly.")
+                print("[Scraper] Table wait timeout. Check if page is empty.")
 
-            # 2. Scrape Details (Deep Crawl)
-            print("[Scraper] finding 'Details' buttons...")
             current_batch = self._scrape_with_details()
             
+            # Logic: If batch has items, it counts as a page.
+            # If batch is empty (all skipped as duplicates), it does NOT count.
             if current_batch:
-                all_items.extend(current_batch)
-                print(f"[Scraper] Found {len(current_batch)} items on page {page_num}")
                 yield current_batch
+                effective_pages += 1
+                print(f"[Scraper] Page yielded new data. Counted as valid page.")
             else:
-                print(f"[Scraper] Warning: No data found on page {page_num}.")
-                self.page.screenshot(path=f"debug_page_{page_num}.png")
+                print(f"[Scraper] Page yielded NO new data (all duplicates?). NOT counting this page.")
             
-            # 3. Next Page
-            if page_num < max_pages:
-                if not self.go_to_next_page():
-                    print("[Scraper] End of pages or could not click next.")
-                    break
-                
-                sleep_time = random.uniform(*DELAY_RANGE)
-                time.sleep(sleep_time)
-
-        return all_items
+            if not self.go_to_next_page():
+                print("[Scraper] No more pages.")
+                break
 
     def _close_overlays(self):
         """Attempt to close known overlays/popups."""
         try:
-            # Common close button selectors
             close_btns = [
-                self.page.locator(".el-dialog__headerbtn"), # Element UI dialog close
-                self.page.locator(".close-btn"),
-                self.page.locator("button[aria-label='Close']"),
-                self.page.get_by_text("关闭").first, # Most likely candidate
-                self.page.get_by_text("我知道了").first,
-                self.page.locator(".guide-close") # Guide overlays
+                self.page.locator(".el-dialog__headerbtn").first,
+                self.page.locator(".close-btn").first,
+                self.page.locator("button[aria-label='Close']").first,
+                self.page.get_by_role("button", name="关闭").first
             ]
             for btn in close_btns:
                 if btn.count() > 0 and btn.is_visible():
-                    print(f"[Scraper] Detecting overlay/popup ({btn}), closing it...")
-                    btn.click(force=True) # Force click in case of overlay overlap
+                    btn.click(force=True)
                     time.sleep(0.5)
-        except:
-            pass
-            
+        except: pass
+
     def _scrape_with_details(self):
-        """Find rows, open detail tabs, scrape, close."""
+        """Find rows, open detail tabs using hardware-emulated clicks, scrape, close."""
         items = []
         try:
-            # Locate rows - skip header
+            # 1. WAIT FOR DATA (Crucial: AJAX might be slow)
+            print("[Scraper] Waiting for table data to render...")
+            try:
+                # Wait for EITHER a Details button OR just table rows (fallback)
+                try:
+                    self.page.wait_for_selector("text='详情'", timeout=10000)
+                except:
+                    # If no 'Details' text found, maybe just wait for rows (Global Search might behave differently)
+                    self.page.wait_for_selector(".el-table__row", timeout=5000)
+                
+                time.sleep(1) # Extra settle time
+            except:
+                print("[Scraper] Wait timeout. Page might be empty or loading very slowly.")
+                return []
+
+            # 2. Find all potential rows
             rows = self.page.locator("tr").all()
             if not rows:
                 rows = self.page.locator(".el-table__row").all()
             
-            print(f"[Debug] Found {len(rows)} rows (including header).")
+            # Filter out header rows that look like data but aren't
+            rows = [r for r in rows if "企业名称" not in r.inner_text()]
             
-            # Iterate
+            print(f"[Debug] Found {len(rows)} potential table rows on this page.")
+            
             for i, row in enumerate(rows):
-                if "企业名称" in row.inner_text(): continue # Skip header
                 
-                # 1. Capture Base Info from List Page (Reliable)
+                # Scroll to row to ensure elements are lazy-loaded/visible
+                try: row.scroll_into_view_if_needed()
+                except: pass
+
+                # Capture Base Info
                 base_info = {}
                 try:
                     cols = row.locator("td").all()
@@ -309,172 +304,194 @@ class NMPAScraper:
                         base_info['entName'] = cols[2].inner_text().strip()
                 except: pass
 
-                # --- DUPLICATION CHECK ---
-                # If we have base info, check if it's already in the DB
+                # Duplication Check
                 if base_info.get('licenseNum') and base_info.get('entName'):
-                     # Check tuple in set
                      if (base_info['licenseNum'], base_info['entName']) in self.existing_records:
-                         print(f"[Scraper] Skipping existing record: {base_info['entName']}")
+                         print(f"[Scraper] Skipping: {base_info['entName']} (Already in DB)")
                          continue
                 
-                # 2. Find detail button
-                btn = row.locator("button, a").filter(has_text="详情").first
+                # Find detail button (Strategy: Text -> Class -> Last Column)
+                btn = row.locator("button, a, .el-button, span").filter(has_text="详情").first
                 
-                if btn.count() > 0 and btn.is_visible():
-                    # Retry logic for detail page opening
+                # FALLBACK 1: Try positional (The button is always in the last column)
+                if btn.count() == 0:
+                     cols = row.locator("td").all()
+                     if cols:
+                         btn = cols[-1].locator("button, a, span, div").first
+                         if btn.count() > 0:
+                             print(f"[Scraper] Found button via Last Column Strategy.")
+
+                # FALLBACK 2: Click Enterprise Name
+                if btn.count() == 0:
+                    print(f"[Scraper] Row {i}: No 'Details' button found. Trying Name Click.")
+                    btn = row.locator("td").nth(2).locator("div, span, a").first 
+                
+                if btn.count() > 0:
                     detail_success = False
                     for attempt in range(3):
                         try:
-                            # 1. Get current pages count
-                            initial_pages = len(self.context.pages)
+                            initial_page_count = len(self.context.pages)
+                            print(f"[Scraper] Row {i}: Opening '{base_info.get('entName', 'Unknown')}'...")
                             
-                            # 2. Click the button (No expect_page context manager, handle manually)
-                            # context manager sometimes conflicts with existing event loops
-                            btn.click()
-                            
-                            # 3. Wait for new page count to increase
-                            print("[Scraper] Waiting for detail page...")
                             detail_page = None
-                            for _ in range(20): # Wait up to 10s
-                                time.sleep(0.5)
-                                if len(self.context.pages) > initial_pages:
-                                    # Get the latest page
-                                    detail_page = self.context.pages[-1]
-                                    break
+                            try: btn.scroll_into_view_if_needed(timeout=2000)
+                            except: pass
                             
-                            if detail_page:
-                                detail_page.wait_for_load_state("domcontentloaded")
-                                # Increased wait for Vue/API rendering
-                                time.sleep(2.5) 
-                                
-                                # Verify data presence
-                                try:
-                                    detail_page.wait_for_selector("td", timeout=3000)
-                                except: pass
+                            box = btn.bounding_box()
+                            if box:
+                                center_x = box['x'] + box['width'] / 2
+                                center_y = box['y'] + box['height'] / 2
+                                # Hardware Click Emulation
+                                self.page.mouse.move(center_x - 5, center_y - 5)
+                                time.sleep(random.uniform(0.2, 0.4))
+                                self.page.mouse.move(center_x, center_y)
+                                time.sleep(random.uniform(0.3, 0.6))
+                                with self.context.expect_page(timeout=10000) as new_page_info:
+                                    self.page.mouse.click(center_x, center_y)
+                                detail_page = new_page_info.value
+                            else:
+                                btn.click()
+                                time.sleep(2)
+                            
+                            if not detail_page and len(self.context.pages) > initial_page_count:
+                                detail_page = self.context.pages[-1]
 
-                                # Extract Details
-                                detail_item = self._extract_detail_fields(detail_page)
+                            if detail_page:
+                                detail_page.bring_to_front()
+                                detail_page.wait_for_load_state("domcontentloaded")
                                 
-                                # Merge
-                                final_item = detail_item.copy()
-                                if base_info.get('entName'): final_item['entName'] = base_info['entName']
-                                if base_info.get('licenseNum'): final_item['licenseNum'] = base_info['licenseNum']
+                                # Content Polling
+                                data_ready = False
+                                for _ in range(20):
+                                    try:
+                                        if detail_page.locator("tr").count() > 5:
+                                            has_val = detail_page.evaluate("""() => {
+                                                const divs = Array.from(document.querySelectorAll('td .cell div'));
+                                                const ignore = ["编号", "企业名称", "法定代表人", "企业负责人", "住所", "经营场所", "经营方式", "经营范围", "库房地址", "备案部门", "备案日期"];
+                                                return divs.some(d => d.innerText.trim().length > 1 && !ignore.includes(d.innerText.trim()));
+                                            }""")
+                                            if has_val: data_ready = True; break
+                                    except: pass
+                                    time.sleep(0.5)
+                                
+                                if not data_ready:
+                                    print(f"[Warning] BLANK page for '{base_info.get('entName')}'. Cooling down for {config.BLOCKED_COOLDOWN}s before RELOAD...")
+                                    time.sleep(config.BLOCKED_COOLDOWN) # Take a nap to reset rate limit
+                                    try:
+                                        detail_page.reload(timeout=15000)
+                                        detail_page.wait_for_load_state("domcontentloaded")
+                                        time.sleep(2)
+                                        # Re-check data after reload
+                                        for _ in range(10):
+                                            if detail_page.locator("tr").count() > 5:
+                                                data_ready = True
+                                                break
+                                            time.sleep(0.5)
+                                    except Exception as e_reload:
+                                        print(f"[Warning] Reload failed: {e_reload}")
+
+                                if not data_ready:
+                                    print(f"[Error] Still BLANK after reload. Saving evidence.")
+                                    self.save_failure_artifacts(detail_page, f"fail_{base_info.get('entName', 'Unknown')}")
+                                    detail_page.close()
+                                    time.sleep(2)
+                                    continue # Retry loop will try clicking again
+
+                                # Extraction
+                                detail_item = self._extract_detail_fields(detail_page)
+                                final_item = {**base_info, **detail_item}
                                 
                                 if final_item.get('entName'):
                                     items.append(final_item)
-                                    print(f"[Scraper] + {final_item['entName']}")
+                                    print(f"[Scraper] Added: {final_item['entName']}")
                                 
                                 detail_page.close()
                                 detail_success = True
+                                time.sleep(random.uniform(2.5, 5.0))
                                 break 
                             else:
-                                print(f"[Detail Retry {attempt+1}/3] No new page opened.")
-                        
+                                print(f"[Detail Retry {attempt+1}/3] No tab found.")
                         except Exception as e:
-                            print(f"[Detail Retry {attempt+1}/3] Failed: {e}")
-                            # Close page if it opened but failed later
-                            try:
-                                if 'detail_page' in locals(): detail_page.close()
-                            except: pass
+                            print(f"[Detail Retry {attempt+1}/3] Error: {e}")
                             time.sleep(2)
                     
-                    if not detail_success:
-                        print(f"[Detail Error] Row {i}: Failed into detail page after 3 attempts.")
-                        # Fallback: Save base info
-
-                        if base_info.get('entName'):
-                            print(f"[Scraper] Saving base info only for Row {i}")
-                            items.append(base_info)
-                        
-                        # Attempt to close stuck page
-                        try:
-                           if 'detail_page' in locals(): detail_page.close()
-                        except: pass
-                else:
-                     # No button, but maybe have base info
-                     if base_info.get('entName'):
-                         items.append(base_info)
-                    
+                    if not detail_success and base_info.get('entName'):
+                        print(f"[Scraper] Failed details, saving base info for: {base_info['entName']}")
+                        items.append(base_info)
         except Exception as e:
-            print(f"[Scraper] Error in detail loop: {e}")
-            
+            print(f"[Scraper] detail loop failure: {e}")
         return items
 
     def _extract_detail_fields(self, page):
-        """Parse the detail page table using strict Key-Value pairing with fuzzy match."""
+        """Parse the table using strict Key-Value pairing with fuzzy match."""
         item = {}
         try:
-            # Map for Chinese keys to our DB keys
-            # Keys here should be compacted (no whitespace)
             key_map = {
-                "编号": "licenseNum",
-                "企业名称": "entName",
-                "法定代表人": "legalRep",
-                "企业负责人": "resPerson",
-                "住所": "entAddress",
-                "经营场所": "opAddress",
-                "经营方式": "opMode",
-                "经营范围": "scope",
-                "库房地址": "warehouseAddr",
-                "备案部门": "filingDept",
-                "备案日期": "filingDate"
+                "编号": "licenseNum", "企业名称": "entName", "法定代表人": "legalRep",
+                "企业负责人": "resPerson", "住所": "entAddress", "经营场所": "opAddress",
+                "经营方式": "opMode", "经营范围": "scope", "库房地址": "warehouseAddr",
+                "备案部门": "filingDept", "备案日期": "filingDate"
             }
-            
-            # Strict strategy: Iterate Table Rows
             rows = page.locator("tr").all()
-            
-            # print(f"[Debug] Parsing details from {page.url}...")
-            
             for row in rows:
                 cells = row.locator("td").all()
                 if len(cells) >= 2:
-                    # Fuzzy normalization: remove spaces, colons, chinese colons
                     raw_label = cells[0].inner_text()
                     compact_label = raw_label.replace(" ", "").replace("　", "").replace("：", "").replace(":", "").strip()
                     val = cells[1].inner_text().strip()
-                    
-                    # Debug print to see what we are finding
-                    # print(f"   Key: '{compact_label}' -> Val: '{val[:10]}...'")
-                    
                     if compact_label in key_map:
                         item[key_map[compact_label]] = val
-                        
-            # Data validation check
-            if not item.get("legalRep"):
-                print(f"[Warning] Legal Rep missing for {item.get('entName', 'Unknown')}. Check key mapping.")
-
-            item['url'] = page.url
-            item['raw_json'] = json.dumps(item, ensure_ascii=False)
-            
         except Exception as e:
-            print(f"[Detail Parsing Error] {e}")
-            
+            print(f"[Parsing Error] {e}")
         return item
 
+    def save_failure_artifacts(self, page, name):
+        """Forensic capture of failed pages."""
+        try:
+            debug_dir = "debug_data"
+            if not os.path.exists(debug_dir): os.makedirs(debug_dir)
+            timestamp = int(time.time())
+            safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip() or "unknown"
+            # HTML
+            with open(os.path.join(debug_dir, f"{safe_name}_{timestamp}.html"), 'w', encoding='utf-8') as f:
+                f.write(page.content())
+            # PNG
+            page.screenshot(path=os.path.join(debug_dir, f"{safe_name}_{timestamp}.png"))
+        except: pass
 
     def go_to_next_page(self):
         try:
+            print("[Scraper] Attempting to go to next page...")
             self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            next_buttons = [
-                self.page.get_by_role("button", name="下一页"),
-                self.page.get_by_text("下一页", exact=True),
-                self.page.get_by_title("下一页"),
-                self.page.locator(".layui-laypage-next"),
-                self.page.locator(".btn-next"),
-                self.page.locator("li.next"),
-            ]
-            for btn in next_buttons:
-                if btn.count() > 0 and btn.is_visible():
-                    btn.click()
-                    return True
+            time.sleep(1)
+            
+            # Element UI standard pagination "Next" button
+            # We must ignore if it has 'disabled' attribute or class
+            next_btn = self.page.locator("button.btn-next").first
+            
+            if next_btn.count() > 0:
+                if next_btn.is_disabled() or "disabled" in next_btn.get_attribute("class"):
+                    print("[Scraper] Next button is disabled. End of list.")
+                    return False
+                next_btn.click()
+                print("[Scraper] Clicked 'Next' button.")
+                return True
+            
+            # Fallback text search
+            fallback_btn = self.page.locator("li.next, button:has-text('下一页')").first
+            if fallback_btn.count() > 0 and fallback_btn.is_visible():
+                 fallback_btn.click()
+                 print("[Scraper] Clicked 'Next' (fallback).")
+                 return True
+                 
+            print("[Scraper] No 'Next' button found.")
             return False
-        except Exception:
+        except Exception as e: 
+            print(f"[Scraper] Pagination error: {e}")
             return False
 
     def close(self):
         try:
-            if self.context: self.context.close()
             if self.browser: self.browser.close()
             if self.playwright: self.playwright.stop()
-        except:
-            pass
+        except: pass

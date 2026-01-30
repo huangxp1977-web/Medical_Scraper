@@ -40,6 +40,7 @@ class Storage:
                 enterprise_name VARCHAR(255) NOT NULL,
                 legal_representative VARCHAR(100),
                 responsible_person VARCHAR(100),
+                contact_phone VARCHAR(50),
                 operation_mode VARCHAR(255),
                 scope TEXT,
                 address TEXT,
@@ -61,11 +62,16 @@ class Storage:
             return 0
         
         inserted_count = 0
+        try:
+            self.conn.ping(reconnect=True)
+        except:
+            self.conn = self._get_connection()
+
         with self.conn.cursor() as cursor:
             sql = f"""
             INSERT INTO {TABLE_NAME} 
-            (enterprise_name, legal_representative, responsible_person, operation_mode, scope, address, operation_address, warehouse_address, filing_department, license_number, filing_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (enterprise_name, legal_representative, responsible_person, contact_phone, operation_mode, scope, address, operation_address, warehouse_address, filing_department, license_number, filing_date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
             legal_representative = VALUES(legal_representative),
             responsible_person = VALUES(responsible_person),
@@ -85,6 +91,7 @@ class Storage:
                     item.get('entName', '') or item.get('enterprise_name', ''),
                     item.get('legalRep', '') or item.get('legal_representative', ''),
                     item.get('resPerson', '') or item.get('responsible_person', ''),
+                    item.get('contactPhone', '') or item.get('contact_phone', ''),
                     item.get('opMode', '') or item.get('operation_mode', ''),
                     item.get('scope', ''),
                     item.get('entAddress', '') or item.get('address', ''),
@@ -103,18 +110,14 @@ class Storage:
         return inserted_count
 
 
-        return inserted_count
-
-
     def get_existing_records(self):
-        """Fetch all (license_number, enterprise_name) pairs for deduplication optimization."""
+        """Fetch only COMPLETE (license_num, ent_name) pairs for deduplication.
+        If a record exists but is missing data (e.g. legal_representative), we don't skip it."""
         with self.conn.cursor() as cursor:
-            # Select only the unique keys
-            cursor.execute(f"SELECT license_number, enterprise_name FROM {TABLE_NAME}")
+            # Only count as 'existing' if it actually has the mission-critical detail
+            cursor.execute(f"SELECT license_number, enterprise_name FROM {TABLE_NAME} WHERE legal_representative IS NOT NULL AND legal_representative != ''")
             rows = cursor.fetchall()
             
-            # Return as a set of tuples for O(1) lookup
-            # Handle potential None values just in case
             return {(row['license_number'], row['enterprise_name']) for row in rows if row['license_number'] or row['enterprise_name']}
 
     def close(self):

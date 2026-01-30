@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Local/Temp files
+*.log
+*.tmp
+debug_data/
+debug_fail_*.html
+debug_page_*.png
+chrome_profile/
+user_data/

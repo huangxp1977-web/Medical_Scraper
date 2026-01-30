@@ -7,7 +7,8 @@ DB_NAME = 'nmpa_data'
 TABLE_NAME = 'medical_device_enterprises'
 
 # Scraper Configuration
-BASE_URL = "https://www.nmpa.gov.cn/datasearch/#category=ylqx"
+BASE_URL = "https://www.nmpa.gov.cn/datasearch/search-result.html"
 HEADLESS = False  # Set to True for production/background run
-MAX_PAGES = 5     # Default limit for testing
-DELAY_RANGE = (3, 6) # Random delay between requests
+MAX_PAGES = 500   # Increased limit for full scraping
+DELAY_RANGE = (2, 4) # Fast scraping!
+BLOCKED_COOLDOWN = 30 # Wait time if blocked (seconds)
