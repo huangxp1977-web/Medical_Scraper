@@ -11,4 +11,4 @@ BASE_URL = "https://www.nmpa.gov.cn/datasearch/search-result.html"
 HEADLESS = False  # Set to True for production/background run
 MAX_PAGES = 500   # Increased limit for full scraping
 DELAY_RANGE = (2, 4) # Fast scraping!
-BLOCKED_COOLDOWN = 30 # Wait time if blocked (seconds)
+BLOCKED_COOLDOWN = 70 # Wait time if blocked (seconds) - Increased as per user request

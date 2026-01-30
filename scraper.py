@@ -374,28 +374,38 @@ class NMPAScraper:
                                     except: pass
                                     time.sleep(0.5)
                                 
-                                if not data_ready:
-                                    print(f"[Warning] BLANK page for '{base_info.get('entName')}'. Cooling down for {config.BLOCKED_COOLDOWN}s before RELOAD...")
-                                    time.sleep(config.BLOCKED_COOLDOWN) # Take a nap to reset rate limit
+                                # Persistent Reload Strategy with Randomized Backoff
+                                reload_attempts = 0
+                                while not data_ready and reload_attempts < 7:
+                                    reload_attempts += 1
+                                    
+                                    # Base ~55s, increasing by ~10s each time, with float randomness
+                                    # Attempt 1: 45 + 10 + random = ~55-58s
+                                    # Attempt 2: 45 + 20 + random = ~65-68s
+                                    wait_time = 45 + (reload_attempts * 10) + random.uniform(0, 4)
+                                    
+                                    print(f"[Warning] BLANK page for '{base_info.get('entName')}'. Waiting {wait_time:.2f}s (Attempt {reload_attempts}/5)...")
+                                    time.sleep(wait_time) 
+                                    
                                     try:
-                                        detail_page.reload(timeout=15000)
+                                        detail_page.reload(timeout=60000)
                                         detail_page.wait_for_load_state("domcontentloaded")
-                                        time.sleep(2)
-                                        # Re-check data after reload
+                                        time.sleep(3)
+                                        # Re-check data
                                         for _ in range(10):
                                             if detail_page.locator("tr").count() > 5:
                                                 data_ready = True
                                                 break
                                             time.sleep(0.5)
-                                    except Exception as e_reload:
-                                        print(f"[Warning] Reload failed: {e_reload}")
+                                    except Exception as e_rel:
+                                        print(f"[Warning] Reload attempt {reload_attempts} failed: {e_rel}")
 
                                 if not data_ready:
-                                    print(f"[Error] Still BLANK after reload. Saving evidence.")
-                                    self.save_failure_artifacts(detail_page, f"fail_{base_info.get('entName', 'Unknown')}")
+                                    print(f"[CRITICAL] Still BLANK after {reload_attempts} attempts (~10 mins).")
+                                    print("[CRITICAL] This indicates a persistent IP BAN or site failure.")
+                                    self.save_failure_artifacts(detail_page, f"Ban_{base_info.get('entName', 'Unknown')}")
                                     detail_page.close()
-                                    time.sleep(2)
-                                    continue # Retry loop will try clicking again
+                                    raise Exception("ABORT: Consistent blank pages detected. Please check IP status or website availability.")
 
                                 # Extraction
                                 detail_item = self._extract_detail_fields(detail_page)
