@@ -3,7 +3,9 @@ import random
 import json
 import os
 from playwright.sync_api import sync_playwright
+import config
 from config import BASE_URL, HEADLESS, DELAY_RANGE
+from rate_limiter import SmartRateLimiter
 
 class NMPAScraper:
     def __init__(self, existing_records=None):
@@ -13,7 +15,25 @@ class NMPAScraper:
         self.intercepted_data = []
         self.playwright = None
         # Set of (licenseNum, entName) already in DB to avoid dupes
-        self.existing_records = existing_records or set()
+        # Set of (licenseNum, entName) already in DB to avoid dupes
+        if existing_records:
+            self.existing_records = existing_records 
+            # Split into fast lookups
+            self.existing_licenses = {rec[0] for rec in existing_records if rec[0]}
+            self.existing_names = {rec[1] for rec in existing_records if rec[1]}
+        else:
+            self.existing_records = set()
+            self.existing_licenses = set()
+            self.existing_names = set()
+        
+        # Initialize the Brain
+        self.limiter = SmartRateLimiter(
+            default_base=config.RL_BASE_WAIT,
+            min_base=config.RL_MIN_WAIT,
+            max_base=config.RL_MAX_WAIT,
+            penalty_add=config.RL_PENALTY_ADD,
+            recovery_step=config.RL_RECOVERY_STEP
+        )
 
     def start(self):
         self.playwright = sync_playwright().start()
@@ -304,11 +324,27 @@ class NMPAScraper:
                         base_info['entName'] = cols[2].inner_text().strip()
                 except: pass
 
-                # Duplication Check
-                if base_info.get('licenseNum') and base_info.get('entName'):
-                     if (base_info['licenseNum'], base_info['entName']) in self.existing_records:
-                         print(f"[Scraper] Skipping: {base_info['entName']} (Already in DB)")
-                         continue
+                # Duplication Check (Loose Coupling)
+                # If EITHER License OR Name matches, we consider it processed.
+                # This handles cases where List Page name is truncated ("Name...") but License matches.
+                is_duplicate = False
+                
+                curr_lic = base_info.get('licenseNum', '').strip()
+                curr_name = base_info.get('entName', '').strip()
+
+                # Check 1: License Match (Strongest Signal)
+                if curr_lic and curr_lic in self.existing_licenses:
+                    is_duplicate = True
+                    # Optimization: If we matched by License, but Name looks truncated, 
+                    # we trust the License and skip.
+                
+                # Check 2: Name Match (Fallback if License is empty or changed)
+                if not is_duplicate and curr_name and curr_name in self.existing_names:
+                    is_duplicate = True
+
+                if is_duplicate:
+                     print(f"[Scraper] Skipping: {curr_name} (Already in DB)")
+                     continue
                 
                 # Find detail button (Strategy: Text -> Class -> Last Column)
                 btn = row.locator("button, a, .el-button, span").filter(has_text="详情").first
@@ -374,17 +410,18 @@ class NMPAScraper:
                                     except: pass
                                     time.sleep(0.5)
                                 
-                                # Persistent Reload Strategy with Randomized Backoff
+                                # Persistent Reload Strategy with Randomized Backoff (Smart Limiter)
                                 reload_attempts = 0
                                 while not data_ready and reload_attempts < 7:
                                     reload_attempts += 1
                                     
-                                    # Base ~55s, increasing by ~10s each time, with float randomness
-                                    # Attempt 1: 45 + 10 + random = ~55-58s
-                                    # Attempt 2: 45 + 20 + random = ~65-68s
-                                    wait_time = 45 + (reload_attempts * 10) + random.uniform(0, 4)
+                                    # Tell the brain we failed
+                                    if reload_attempts == 1: self.limiter.record_block()
                                     
-                                    print(f"[Warning] BLANK page for '{base_info.get('entName')}'. Waiting {wait_time:.2f}s (Attempt {reload_attempts}/5)...")
+                                    # Get adaptive wait time (Base + Increments)
+                                    wait_time = self.limiter.get_backoff_wait(reload_attempts)
+                                    
+                                    print(f"[SmartLimiter] BLANK page! Penalty Base: {self.limiter.current_base:.1f}s. Waiting {wait_time:.2f}s (Attempt {reload_attempts}/7)...")
                                     time.sleep(wait_time) 
                                     
                                     try:
@@ -409,15 +446,45 @@ class NMPAScraper:
 
                                 # Extraction
                                 detail_item = self._extract_detail_fields(detail_page)
-                                final_item = {**base_info, **detail_item}
+                                
+                                # CRITICAL: Don't let detail page overwrite the KEYS (license, name) 
+                                # used for deduplication, otherwise slight text differences cause infinite scraping.
+                                final_item = base_info.copy()
+                                final_item.update(detail_item)
+
+                                # DEBUG: Check if this was a False Negative (List said New, Detail says Old)
+                                d_lic = detail_item.get('licenseNum', '').strip()
+                                d_name = detail_item.get('entName', '').strip()
+                                if (d_lic and d_lic in self.existing_licenses) or (d_name and d_name in self.existing_names):
+                                    print(f"[Debug] False Negative Detected! URL: {detail_page.url}")
+                                    try:
+                                        with open("problem_urls.txt", "a", encoding="utf-8") as f:
+                                            f.write(f"{detail_page.url}\n")
+                                    except: pass
+                                
+                                # Restore the original keys if they existed, to ensure consistency with List Page
+                                if base_info.get('licenseNum'): final_item['licenseNum'] = base_info['licenseNum']
+                                if base_info.get('entName'): final_item['entName'] = base_info['entName']
                                 
                                 if final_item.get('entName'):
                                     items.append(final_item)
+                                    # Update Dedupe Set immediately to prevent re-scraping in same session
+                                    if final_item.get('licenseNum'):
+                                        self.existing_licenses.add(final_item['licenseNum'].strip())
+                                    if final_item.get('entName'):
+                                        self.existing_names.add(final_item['entName'].strip())
+                                    
                                     print(f"[Scraper] Added: {final_item['entName']}")
+                                    # Tell the brain we won
+                                    self.limiter.record_success()
                                 
                                 detail_page.close()
                                 detail_success = True
-                                time.sleep(random.uniform(2.5, 5.0))
+                                
+                                # Adaptive Sleep
+                                sleep_time = self.limiter.get_delay()
+                                print(f"[SmartLimiter] Resting for {sleep_time:.2f}s...")
+                                time.sleep(sleep_time)
                                 break 
                             else:
                                 print(f"[Detail Retry {attempt+1}/3] No tab found.")
@@ -433,26 +500,46 @@ class NMPAScraper:
         return items
 
     def _extract_detail_fields(self, page):
-        """Parse the table using strict Key-Value pairing with fuzzy match."""
+        """Parse the table using strict Key-Value pairing with fuzzy match and retry logic."""
         item = {}
-        try:
-            key_map = {
-                "编号": "licenseNum", "企业名称": "entName", "法定代表人": "legalRep",
-                "企业负责人": "resPerson", "住所": "entAddress", "经营场所": "opAddress",
-                "经营方式": "opMode", "经营范围": "scope", "库房地址": "warehouseAddr",
-                "备案部门": "filingDept", "备案日期": "filingDate"
-            }
-            rows = page.locator("tr").all()
-            for row in rows:
-                cells = row.locator("td").all()
-                if len(cells) >= 2:
-                    raw_label = cells[0].inner_text()
-                    compact_label = raw_label.replace(" ", "").replace("　", "").replace("：", "").replace(":", "").strip()
-                    val = cells[1].inner_text().strip()
-                    if compact_label in key_map:
-                        item[key_map[compact_label]] = val
-        except Exception as e:
-            print(f"[Parsing Error] {e}")
+        # Retry up to 3 times if essential data is missing (Async Rendering)
+        for attempt in range(3):
+            try:
+                # Refresh element list on each attempt
+                rows = page.locator("tr").all()
+                if not rows:
+                    time.sleep(1)
+                    continue
+
+                item = {} # Reset
+                key_map = {
+                    "编号": "licenseNum", "企业名称": "entName", "法定代表人": "legalRep",
+                    "企业负责人": "resPerson", "住所": "entAddress", "经营场所": "opAddress",
+                    "经营方式": "opMode", "经营范围": "scope", "库房地址": "warehouseAddr",
+                    "备案部门": "filingDept", "备案日期": "filingDate"
+                }
+                
+                for row in rows:
+                    cells = row.locator("td").all()
+                    if len(cells) >= 2:
+                        raw_label = cells[0].inner_text()
+                        # Normalize label: Remove spaces, colons, newlines
+                        compact_label = raw_label.replace(" ", "").replace("　", "").replace("：", "").replace(":", "").replace("\n", "").strip()
+                        val = cells[1].inner_text().strip()
+                        
+                        if compact_label in key_map:
+                            item[key_map[compact_label]] = val
+                
+                # Validation: If we got a dict but Name/License is empty, it might be a bad render.
+                if item.get("entName") and item.get("licenseNum"):
+                    break # Success!
+                else:
+                    print(f"[Parser] Attempt {attempt+1}: Data incomplete (Name/Lic missing). Retrying...")
+                    time.sleep(1.5)
+            except Exception as e:
+                print(f"[Parsing Error] Attempt {attempt+1}: {e}")
+                time.sleep(1)
+        
         return item
 
     def save_failure_artifacts(self, page, name):

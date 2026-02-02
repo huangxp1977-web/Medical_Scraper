@@ -115,10 +115,33 @@ class Storage:
         If a record exists but is missing data (e.g. legal_representative), we don't skip it."""
         with self.conn.cursor() as cursor:
             # Only count as 'existing' if it actually has the mission-critical detail
-            cursor.execute(f"SELECT license_number, enterprise_name FROM {TABLE_NAME} WHERE legal_representative IS NOT NULL AND legal_representative != ''")
+            # MODIFIED: Removed strict check for legal_representative to prevent infinite re-scraping of companies that just don't have that field.
+            cursor.execute(f"SELECT license_number, enterprise_name FROM {TABLE_NAME}")
             rows = cursor.fetchall()
             
-            return {(row['license_number'], row['enterprise_name']) for row in rows if row['license_number'] or row['enterprise_name']}
+            return {
+                (
+                    row['license_number'].strip() if row['license_number'] else '',
+                    row['enterprise_name'].strip() if row['enterprise_name'] else ''
+                ) 
+                for row in rows if row['license_number'] or row['enterprise_name']
+            }
+
+    def get_empty_records(self):
+        """Fetch records that exist but have empty detail fields (Candidate for Re-scrape)."""
+        with self.conn.cursor() as cursor:
+            # Check for records where Name exists but LegalRep/License is missing
+            sql = f"""
+            SELECT enterprise_name 
+            FROM {TABLE_NAME} 
+            WHERE ((legal_representative IS NULL OR legal_representative = '') 
+               AND (responsible_person IS NULL OR responsible_person = ''))
+               AND enterprise_name IS NOT NULL 
+               AND enterprise_name != ''
+            """
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            return [row['enterprise_name'] for row in rows]
 
     def close(self):
         if self.conn:
