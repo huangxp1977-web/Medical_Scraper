@@ -5,7 +5,7 @@ import os
 from playwright.sync_api import sync_playwright
 import config
 from config import BASE_URL, HEADLESS, DELAY_RANGE
-from rate_limiter import SmartRateLimiter
+from engine.rate_limiter import SmartRateLimiter
 
 class NMPAScraper:
     def __init__(self, existing_records=None):
@@ -26,14 +26,27 @@ class NMPAScraper:
             self.existing_licenses = set()
             self.existing_names = set()
         
-        # Initialize the Brain
-        self.limiter = SmartRateLimiter(
-            default_base=config.RL_BASE_WAIT,
-            min_base=config.RL_MIN_WAIT,
-            max_base=config.RL_MAX_WAIT,
-            penalty_add=config.RL_PENALTY_ADD,
-            recovery_step=config.RL_RECOVERY_STEP
-        )
+        # Initialize the Brain (choose limiter based on config)
+        if config.USE_AGGRESSIVE_RECOVERY:
+            # 🧪 Experimental Mode: Use aggressive recovery limiter
+            from engine.rate_limiter_experimental import SmartRateLimiter as ExperimentalLimiter
+            self.limiter = ExperimentalLimiter(
+                default_base=config.RL_BASE_WAIT,
+                min_base=config.RL_MIN_WAIT,
+                max_base=config.RL_MAX_WAIT,
+                penalty_add=config.RL_PENALTY_ADD,
+                recovery_step=config.RL_RECOVERY_STEP,
+                aggressive_recovery=True
+            )
+            print("[🧪 EXPERIMENTAL MODE] Using Aggressive Recovery Limiter")
+        else:
+            self.limiter = SmartRateLimiter(
+                default_base=config.RL_BASE_WAIT,
+                min_base=config.RL_MIN_WAIT,
+                max_base=config.RL_MAX_WAIT,
+                penalty_add=config.RL_PENALTY_ADD,
+                recovery_step=config.RL_RECOVERY_STEP
+            )
 
     def start(self):
         self.playwright = sync_playwright().start()
@@ -73,8 +86,11 @@ class NMPAScraper:
         except Exception:
             pass
 
-    def search(self, keyword="上海", max_pages=5):
-        """Main search entry point with tab-syncing and fallback search logic."""
+    def search(self, keyword="上海", max_pages=5, skip_dedupe=False):
+        """
+        Main search entry point with tab-syncing and fallback search logic.
+        skip_dedupe: If True, skip duplicate checking (used during repair phase to process all same-name records)
+        """
         try:
             # 1. SCAN FOR EXISTING RESULT TAB (User-first approach)
             print("[Scraper] Scanning open tabs for 'search-result.html'...")
@@ -192,10 +208,10 @@ class NMPAScraper:
                         time.sleep(1)
 
                 if not search_success:
-                    print(f"[Error] Failed to set search keyword to '{keyword}'. Aborting search for this keyword.")
-                    try: self.page.screenshot(path="debug_search_fail.png")
+                    print(f"[Error] Failed to set search keyword to '{keyword}'. Abort.")
+                    try: self.page.screenshot(path="logs/debug_search_fail.png")
                     except: pass
-                    return [] # CRITICAL: STOP if we didn't set the keyword
+                    return [] 
                 
                 time.sleep(1)
                 
@@ -233,6 +249,7 @@ class NMPAScraper:
         # Yielding results loop (Smart Page Counting)
         effective_pages = 0
         total_attempts = 0 # Safety breaker
+        self.current_discovered = set()
         
         while effective_pages < max_pages:
             total_attempts += 1
@@ -250,16 +267,21 @@ class NMPAScraper:
             except:
                 print("[Scraper] Table wait timeout. Check if page is empty.")
 
-            current_batch = self._scrape_with_details()
+            current_batch = self._scrape_with_details(skip_dedupe=skip_dedupe)
             
             # Logic: If batch has items, it counts as a page.
-            # If batch is empty (all skipped as duplicates), it does NOT count.
-            if current_batch:
-                yield current_batch
-                effective_pages += 1
-                print(f"[Scraper] Page yielded new data. Counted as valid page.")
+            # We yield both the data AND any NEW prefixes found during this page
+            if current_batch or self.current_discovered:
+                yield (current_batch, list(self.current_discovered))
+                # Clear for next yield to avoid redundant notification, 
+                # though the caller manages the global set.
+                self.current_discovered = set() 
+                
+                if current_batch:
+                    effective_pages += 1
+                    print(f"[Scraper] Page yielded new data. Counted as valid page.")
             else:
-                print(f"[Scraper] Page yielded NO new data (all duplicates?). NOT counting this page.")
+                print(f"[Scraper] Page yielded NO new data and no new prefixes. NOT counting.")
             
             if not self.go_to_next_page():
                 print("[Scraper] No more pages.")
@@ -280,7 +302,7 @@ class NMPAScraper:
                     time.sleep(0.5)
         except: pass
 
-    def _scrape_with_details(self):
+    def _scrape_with_details(self, skip_dedupe=False):
         """Find rows, open detail tabs using hardware-emulated clicks, scrape, close."""
         items = []
         try:
@@ -320,27 +342,50 @@ class NMPAScraper:
                 try:
                     cols = row.locator("td").all()
                     if len(cols) >= 3:
-                        base_info['licenseNum'] = cols[1].inner_text().strip()
+                        lic_text = cols[1].inner_text().strip()
+                        base_info['licenseNum'] = lic_text
                         base_info['entName'] = cols[2].inner_text().strip()
+                        
+                        # DYNAMIC KEYWORD HARVESTING (User Request)
+                        # Extract the regulator identifier (e.g. 京朝食药监械经营备案)
+                        # Harvesting happens for ALL rows, even duplicates, to build the full discovery map.
+                        if lic_text:
+                            # Use regex to find the first sequence of digits (usually the year) and take everything before it
+                            prefix_match = re.search(r'^(\D+)', lic_text)
+                            if prefix_match:
+                                prefix = prefix_match.group(1).strip()
+                                # Common noise removal: stop at '2', '1' or '号' if greedy
+                                prefix = re.split(r'20\d\d|20[012]\d', prefix)[0].strip()
+                                if len(prefix) > 1:
+                                    self.current_discovered.add(prefix)
                 except: pass
 
-                # Duplication Check (Loose Coupling)
-                # If EITHER License OR Name matches, we consider it processed.
-                # This handles cases where List Page name is truncated ("Name...") but License matches.
+                # Duplication Check (Loose Coupling with Truncation Support)
+                # Skip check during repair phase to allow re-scraping same-named records
                 is_duplicate = False
-                
-                curr_lic = base_info.get('licenseNum', '').strip()
-                curr_name = base_info.get('entName', '').strip()
+                if not skip_dedupe:
+                    curr_lic = base_info.get('licenseNum', '').strip()
+                    curr_name = base_info.get('entName', '').strip()
 
-                # Check 1: License Match (Strongest Signal)
-                if curr_lic and curr_lic in self.existing_licenses:
-                    is_duplicate = True
-                    # Optimization: If we matched by License, but Name looks truncated, 
-                    # we trust the License and skip.
-                
-                # Check 2: Name Match (Fallback if License is empty or changed)
-                if not is_duplicate and curr_name and curr_name in self.existing_names:
-                    is_duplicate = True
+                    # Check by license number (exact match)
+                    if curr_lic and curr_lic in self.existing_licenses:
+                        is_duplicate = True
+                    
+                    # Check by name (support truncated names with "...")
+                    if not is_duplicate and curr_name:
+                        # If list page name is truncated (ends with "..."), match by prefix
+                        if curr_name.endswith('...'):
+                            name_prefix = curr_name[:-3].strip()  # Remove "..."
+                            # Check if any existing name starts with this prefix
+                            for existing_name in self.existing_names:
+                                if existing_name.startswith(name_prefix):
+                                    is_duplicate = True
+                                    print(f"[Dedupe] Truncated match: '{curr_name}' → '{existing_name}'")
+                                    break
+                        else:
+                            # Exact name match
+                            if curr_name in self.existing_names:
+                                is_duplicate = True
 
                 if is_duplicate:
                      print(f"[Scraper] Skipping: {curr_name} (Already in DB)")
@@ -393,99 +438,107 @@ class NMPAScraper:
                                 detail_page = self.context.pages[-1]
 
                             if detail_page:
-                                detail_page.bring_to_front()
-                                detail_page.wait_for_load_state("domcontentloaded")
-                                
-                                # Content Polling
-                                data_ready = False
-                                for _ in range(20):
-                                    try:
-                                        if detail_page.locator("tr").count() > 5:
-                                            has_val = detail_page.evaluate("""() => {
-                                                const divs = Array.from(document.querySelectorAll('td .cell div'));
-                                                const ignore = ["编号", "企业名称", "法定代表人", "企业负责人", "住所", "经营场所", "经营方式", "经营范围", "库房地址", "备案部门", "备案日期"];
-                                                return divs.some(d => d.innerText.trim().length > 1 && !ignore.includes(d.innerText.trim()));
-                                            }""")
-                                            if has_val: data_ready = True; break
-                                    except: pass
-                                    time.sleep(0.5)
-                                
-                                # Persistent Reload Strategy with Randomized Backoff (Smart Limiter)
-                                reload_attempts = 0
-                                while not data_ready and reload_attempts < 7:
-                                    reload_attempts += 1
+                                try:
+                                    detail_page.bring_to_front()
+                                    detail_page.wait_for_load_state("domcontentloaded")
                                     
-                                    # Tell the brain we failed
-                                    if reload_attempts == 1: self.limiter.record_block()
-                                    
-                                    # Get adaptive wait time (Base + Increments)
-                                    wait_time = self.limiter.get_backoff_wait(reload_attempts)
-                                    
-                                    print(f"[SmartLimiter] BLANK page! Penalty Base: {self.limiter.current_base:.1f}s. Waiting {wait_time:.2f}s (Attempt {reload_attempts}/7)...")
-                                    time.sleep(wait_time) 
-                                    
-                                    try:
-                                        detail_page.reload(timeout=60000)
-                                        detail_page.wait_for_load_state("domcontentloaded")
-                                        time.sleep(3)
-                                        # Re-check data
-                                        for _ in range(10):
+                                    # Content Polling
+                                    data_ready = False
+                                    for _ in range(20):
+                                        try:
                                             if detail_page.locator("tr").count() > 5:
-                                                data_ready = True
-                                                break
-                                            time.sleep(0.5)
-                                    except Exception as e_rel:
-                                        print(f"[Warning] Reload attempt {reload_attempts} failed: {e_rel}")
-
-                                if not data_ready:
-                                    print(f"[CRITICAL] Still BLANK after {reload_attempts} attempts (~10 mins).")
-                                    print("[CRITICAL] This indicates a persistent IP BAN or site failure.")
-                                    self.save_failure_artifacts(detail_page, f"Ban_{base_info.get('entName', 'Unknown')}")
-                                    detail_page.close()
-                                    raise Exception("ABORT: Consistent blank pages detected. Please check IP status or website availability.")
-
-                                # Extraction
-                                detail_item = self._extract_detail_fields(detail_page)
-                                
-                                # CRITICAL: Don't let detail page overwrite the KEYS (license, name) 
-                                # used for deduplication, otherwise slight text differences cause infinite scraping.
-                                final_item = base_info.copy()
-                                final_item.update(detail_item)
-
-                                # DEBUG: Check if this was a False Negative (List said New, Detail says Old)
-                                d_lic = detail_item.get('licenseNum', '').strip()
-                                d_name = detail_item.get('entName', '').strip()
-                                if (d_lic and d_lic in self.existing_licenses) or (d_name and d_name in self.existing_names):
-                                    print(f"[Debug] False Negative Detected! URL: {detail_page.url}")
-                                    try:
-                                        with open("problem_urls.txt", "a", encoding="utf-8") as f:
-                                            f.write(f"{detail_page.url}\n")
-                                    except: pass
-                                
-                                # Restore the original keys if they existed, to ensure consistency with List Page
-                                if base_info.get('licenseNum'): final_item['licenseNum'] = base_info['licenseNum']
-                                if base_info.get('entName'): final_item['entName'] = base_info['entName']
-                                
-                                if final_item.get('entName'):
-                                    items.append(final_item)
-                                    # Update Dedupe Set immediately to prevent re-scraping in same session
-                                    if final_item.get('licenseNum'):
-                                        self.existing_licenses.add(final_item['licenseNum'].strip())
-                                    if final_item.get('entName'):
-                                        self.existing_names.add(final_item['entName'].strip())
+                                                has_val = detail_page.evaluate("""() => {
+                                                    const divs = Array.from(document.querySelectorAll('td .cell div'));
+                                                    const ignore = ["编号", "企业名称", "法定代表人", "企业负责人", "住所", "经营场所", "经营方式", "经营范围", "库房地址", "备案部门", "备案日期"];
+                                                    return divs.some(d => d.innerText.trim().length > 1 && !ignore.includes(d.innerText.trim()));
+                                                }""")
+                                                if has_val: data_ready = True; break
+                                        except: pass
+                                        time.sleep(0.5)
                                     
-                                    print(f"[Scraper] Added: {final_item['entName']}")
-                                    # Tell the brain we won
-                                    self.limiter.record_success()
-                                
-                                detail_page.close()
-                                detail_success = True
-                                
-                                # Adaptive Sleep
-                                sleep_time = self.limiter.get_delay()
-                                print(f"[SmartLimiter] Resting for {sleep_time:.2f}s...")
-                                time.sleep(sleep_time)
-                                break 
+                                    # Persistent Reload Strategy with Randomized Backoff (Smart Limiter)
+                                    reload_attempts = 0
+                                    while not data_ready and reload_attempts < 7:
+                                        reload_attempts += 1
+                                        
+                                        # Tell the brain we failed
+                                        if reload_attempts == 1: self.limiter.record_block()
+                                        
+                                        # Get adaptive wait time (Base + Increments)
+                                        wait_time = self.limiter.get_backoff_wait(reload_attempts)
+                                        
+                                        print(f"[SmartLimiter] BLANK page! Penalty Base: {self.limiter.current_base:.1f}s. Waiting {wait_time:.2f}s (Attempt {reload_attempts}/7)...")
+                                        time.sleep(wait_time) 
+                                        
+                                        try:
+                                            detail_page.reload(timeout=60000)
+                                            detail_page.wait_for_load_state("domcontentloaded")
+                                            time.sleep(3)
+                                            # Re-check data
+                                            for _ in range(10):
+                                                if detail_page.locator("tr").count() > 5:
+                                                    data_ready = True
+                                                    break
+                                                time.sleep(0.5)
+                                        except Exception as e_rel:
+                                            print(f"[Warning] Reload attempt {reload_attempts} failed: {e_rel}")
+
+                                    if not data_ready:
+                                        print(f"[CRITICAL] Still BLANK after {reload_attempts} attempts (~10 mins).")
+                                        self._log_failure(base_info, "Blank Page / IP Block")
+                                        self.save_failure_artifacts(detail_page, f"Ban_{base_info.get('entName', 'Unknown')}")
+                                        raise Exception("ABORT: Consistent blank pages detected. Please check IP status or website availability.")
+
+                                    # Extraction
+                                    detail_item = self._extract_detail_fields(detail_page)
+                                    
+                                    if not detail_item:
+                                        print(f"[Scraper] Extraction failed (Incomplete data) for: {base_info.get('entName')}. Retrying or skipping...")
+                                        continue # Go to next attempt for this row
+
+                                    # Use DETAIL page data as authoritative (has full names, not truncated)
+                                    # Only fall back to list page if detail is missing
+                                    final_item = detail_item.copy()
+                                    # Fill in any missing fields from list page
+                                    for key, value in base_info.items():
+                                        if key not in final_item or not final_item.get(key):
+                                            final_item[key] = value
+                                    
+                                    # IMPORTANT: Always use detail page entName if available (it's complete)
+                                    # List page names may be truncated with "..."
+                                    if detail_item.get('entName'):
+                                        final_item['entName'] = detail_item['entName']
+                                    
+                                    # Double Check: Ensure we have a REAL detail field
+                                    if final_item.get('legalRep') or final_item.get('resPerson') or final_item.get('opMode'):
+                                        items.append(final_item)
+                                        # Update Dedupe Set immediately to prevent re-scraping in same session
+                                        if final_item.get('licenseNum'):
+                                            self.existing_licenses.add(final_item['licenseNum'].strip())
+                                        if final_item.get('entName'):
+                                            self.existing_names.add(final_item['entName'].strip())
+                                        
+                                        print(f"[Scraper] Captured: {final_item['entName']}")
+                                        # Tell the brain we won
+                                        self.limiter.record_success()
+                                        detail_success = True
+                                    else:
+                                        print(f"[Warning] Record for {final_item['entName']} filtered out: No detail fields extracted.")
+                                        self._log_failure(base_info, "Empty Detail Fields (Zero Payload)")
+                                    
+                                    # Adaptive Sleep
+                                    sleep_time = self.limiter.get_delay()
+                                    print(f"[SmartLimiter] Resting for {sleep_time:.2f}s...")
+                                    time.sleep(sleep_time)
+                                    break
+                                    
+                                finally:
+                                    # CRITICAL: Always close detail page to prevent tab accumulation
+                                    try:
+                                        detail_page.close()
+                                        print(f"[Scraper]Detail page closed.")
+                                    except:
+                                        pass 
                             else:
                                 print(f"[Detail Retry {attempt+1}/3] No tab found.")
                         except Exception as e:
@@ -493,8 +546,8 @@ class NMPAScraper:
                             time.sleep(2)
                     
                     if not detail_success and base_info.get('entName'):
-                        print(f"[Scraper] Failed details, saving base info for: {base_info['entName']}")
-                        items.append(base_info)
+                        print(f"[Scraper] Failed details for: {base_info['entName']}. Item will NOT be saved to avoid ghost records.")
+                        self._log_failure(base_info, "Extraction Failed / Closed unexpectedly")
         except Exception as e:
             print(f"[Scraper] detail loop failure: {e}")
         return items
@@ -528,24 +581,46 @@ class NMPAScraper:
                         val = cells[1].inner_text().strip()
                         
                         if compact_label in key_map:
-                            item[key_map[compact_label]] = val
+                            field_key = key_map[compact_label]
+                            
+                            # 🧹 数据清洗：过滤无效的法人/负责人值
+                            if field_key in ("legalRep", "resPerson"):
+                                import re
+                                # 1. 去除括号前缀，如 "(负责人)陈泓" -> "陈泓"
+                                val = re.sub(r'^[\(（][^)）]*[\)）]', '', val).strip()
+                                # 2. 去除括号后缀，如 "罗焯(总公司)" -> "罗焯"
+                                val = re.sub(r'[\(（][^)）]*[\)）]$', '', val).strip()
+                                
+                                # 3. 过滤无效值
+                                invalid_values = {"无", "无此项", "无法人", "-", "/", "\\", "——", "—", "暂无", "无数据", "空", "null", "NULL", "N/A", "n/a"}
+                                if val in invalid_values:
+                                    val = ""
+                                # 4. 只要包含*就不存
+                                elif "*" in val:
+                                    val = ""
+                            
+                            item[field_key] = val
                 
-                # Validation: If we got a dict but Name/License is empty, it might be a bad render.
-                if item.get("entName") and item.get("licenseNum"):
-                    break # Success!
+                # Validation: Require at least Name, License AND identity data
+                if item.get("entName") and item.get("licenseNum") and (item.get("legalRep") or item.get("resPerson")):
+                    break 
                 else:
-                    print(f"[Parser] Attempt {attempt+1}: Data incomplete (Name/Lic missing). Retrying...")
+                    print(f"[Parser] Attempt {attempt+1}: Identity data missing. Retrying...")
                     time.sleep(1.5)
             except Exception as e:
                 print(f"[Parsing Error] Attempt {attempt+1}: {e}")
                 time.sleep(1)
         
+        # Final Verification
+        if not item.get("legalRep") and not item.get("resPerson"):
+            return None
+            
         return item
 
     def save_failure_artifacts(self, page, name):
         """Forensic capture of failed pages."""
         try:
-            debug_dir = "debug_data"
+            debug_dir = os.path.join("logs", "debug_data")
             if not os.path.exists(debug_dir): os.makedirs(debug_dir)
             timestamp = int(time.time())
             safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip() or "unknown"
@@ -586,6 +661,21 @@ class NMPAScraper:
         except Exception as e: 
             print(f"[Scraper] Pagination error: {e}")
             return False
+
+    def _log_failure(self, base_info, reason):
+        """Append to logs/failed_details.jsonl for manual review."""
+        try:
+            log_file = os.path.join("logs", "failed_details.jsonl")
+            entry = {
+                "timestamp": int(time.time()),
+                "iso_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "entName": base_info.get("entName", "Unknown"),
+                "licenseNum": base_info.get("licenseNum", "Unknown"),
+                "reason": reason
+            }
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except: pass
 
     def close(self):
         try:

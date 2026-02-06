@@ -4,7 +4,7 @@ import json
 import os
 
 class SmartRateLimiter:
-    def __init__(self, default_base=45, min_base=20, max_base=120, penalty_add=20, recovery_step=1, log_path="scraper_behavior.jsonl"):
+    def __init__(self, default_base=45, min_base=20, max_base=120, penalty_add=20, recovery_step=1, log_path="logs/scraper_behavior.jsonl"):
         """
         Smart Adaptive Rate Limiter (PID-like Control).
         """
