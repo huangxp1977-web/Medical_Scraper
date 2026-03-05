@@ -2,6 +2,7 @@ import time
 import random
 import json
 import os
+import re
 from playwright.sync_api import sync_playwright
 import config
 from config import BASE_URL, HEADLESS, DELAY_RANGE
@@ -153,59 +154,20 @@ class NMPAScraper:
                 print(f"[Scraper] Inputting keyword '{keyword}'...")
                 search_success = False
                 
-                for attempt in range(3):
-                    # JS Strategy: Find input, wipe it, set it, dispatch events
-                    # This bypasses any "element not interactable" or focus issues
-                    js_success = self.page.evaluate(f"""(kw) => {{
-                        // Try multiple ways to find the MAIN search input
-                        const inputs = Array.from(document.querySelectorAll('input'));
-                        // Filter for visible text inputs that look like the main search bar AND ARE NOT READONLY
-                        const target = inputs.find(i => {{
-                            const style = window.getComputedStyle(i);
-                            return style.display !== 'none' && 
-                                    style.visibility !== 'hidden' && 
-                                    i.type === 'text' && 
-                                    !i.readOnly && // CRITICAL FIX: Ignore the 'Select' dropdown
-                                    (i.placeholder.includes('企业名称') || i.className.includes('el-input__inner')) &&
-                                    i.clientWidth > 100; 
-                        }});
-                        
-                        if (target) {{
-                            target.focus();
-                            target.value = ''; // Wipe
-                            target.value = kw; // Set
-                            
-                            // CJK Event Sequence for Element UI / Vue
-                            target.dispatchEvent(new Event('compositionstart', {{ bubbles: true }}));
-                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            target.dispatchEvent(new Event('compositionend', {{ bubbles: true }}));
-                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            
-                            return true;
-                        }}
-                        return false;
-                    }}""", keyword)
-                    
-                    if js_success:
-                        print(f"[Scraper] JS injected '{keyword}'. Verifying...")
-                        time.sleep(1)
-                        # Verify value
-                        actual_val = self.page.evaluate("""() => {
-                            // Specific verification: Only verify the input with '企业名称' placeholder to avoid reading the dropdown
-                            const i = document.querySelector('input[placeholder*="企业名称"]');
-                            return i ? i.value : '';
-                        }""")
-                        
-                        if actual_val == keyword:
-                            print(f"[Scraper] Verified input is '{keyword}'. Pressing Enter.")
-                            self.page.keyboard.press("Enter")
-                            search_success = True
-                            break
-                        else:
-                            print(f"[Scraper] Mismatch after JS! Expected '{keyword}', got '{actual_val}'.")
-                    else:
-                        print(f"[Scraper] JS could not find input box (Attempt {attempt+1}). Retrying...")
-                        time.sleep(1)
+                # 🔧 对齐成功诊断脚本：使用 fill + 物理按键触发 Vue 同步
+                input_locator = self.page.locator('input[placeholder*="企业名称"]')
+                if input_locator.count() > 0:
+                    input_locator.fill(keyword)
+                    time.sleep(0.5)
+                    self.page.keyboard.press("End")
+                    self.page.keyboard.press("Space")
+                    self.page.keyboard.press("Backspace")
+                    time.sleep(0.5)
+                    self.page.keyboard.press("Enter")
+                    search_success = True
+                else:
+                    print(f"[Error] Could not find search input for '{keyword}'")
+                    return []
 
                 if not search_success:
                     print(f"[Error] Failed to set search keyword to '{keyword}'. Abort.")
@@ -213,46 +175,41 @@ class NMPAScraper:
                     except: pass
                     return [] 
                 
-                time.sleep(1)
-                
-                # Click Search Button (Magnifier) as backup
-                try:
-                    # Search for the button next to the input
-                    self.page.evaluate("""() => {
-                        const btns = Array.from(document.querySelectorAll('button'));
-                        const searchBtn = btns.find(b => b.innerText.includes('查询') || b.querySelector('i.el-icon-search'));
-                        if (searchBtn) searchBtn.click();
-                    }""")
-                except: pass
                 
                 print("[Scraper] Search trigger sequence completed.")
             except Exception as e_int:
                 print(f"[Scraper] Interaction sequence failed: {e_int}")
 
-            # Check for "No Data" immediately
+            # 🔧 FIX: 不再用 wait_for_selector("tr") —— 已确认它会破坏 Vue 分页状态
             print("[Scraper] Verifying search results...")
-            try:
-                self.page.wait_for_selector("tr, .el-table__row, .no-data, text='暂无数据'", timeout=8000)
-                if self.page.locator("text='暂无数据内容'").count() > 0 or self.page.locator("text='暂无数据'").count() > 0:
-                     print("[Scraper] Search returned NO DATA. Stopping.")
-                     return []
-            except:
-                pass
-
-            self.page.wait_for_load_state("domcontentloaded")
-            time.sleep(2) # Settle time
+            time.sleep(5)  # 等待搜索结果加载
+            if self.page.locator("text='暂无数据内容'").count() > 0 or self.page.locator("text='暂无数据'").count() > 0:
+                 print("[Scraper] Search returned NO DATA. Stopping.")
+                 return []
 
         except Exception as e:
             print(f"[Scraper] search() method failed: {e}")
             return []
 
+        # 🔧 读取网页上的总条数/总页数（用于超限记录）
+        self._read_pagination_info()
+        
         # Yielding results loop (Smart Page Counting)
         effective_pages = 0
         total_attempts = 0 # Safety breaker
         self.current_discovered = set()
         
+        # 🔧 FIX: 网站最多只允许翻1000页（即使数据显示有更多页）
+        SITE_PAGE_LIMIT = 1000
+        
         while effective_pages < max_pages:
             total_attempts += 1
+            
+            # 🔧 FIX: 实际翻页数不能超过网站限制
+            if total_attempts > SITE_PAGE_LIMIT:
+                print(f"[Scraper] Reached site's {SITE_PAGE_LIMIT}-page limit. Stopping.")
+                break
+            
             if total_attempts > max_pages * 5: # Prevent infinite loops if site is huge but all dups
                 print("[Scraper] Max safety attempts reached. Stopping.")
                 break
@@ -261,13 +218,23 @@ class NMPAScraper:
             time.sleep(2)
             self._close_overlays()
 
-            # Wait for data table
+            # 🔧 FIX: 不再用 wait_for_selector("tr") —— 由 _scrape_with_details 内部的
+            # wait_for_selector("详情"/".el-table__row") 来等待数据加载
             try:
-                self.page.wait_for_selector("tr, .el-table__row", timeout=15000)
-            except:
-                print("[Scraper] Table wait timeout. Check if page is empty.")
-
-            current_batch = self._scrape_with_details(skip_dedupe=skip_dedupe)
+                current_batch = self._scrape_with_details(skip_dedupe=skip_dedupe)
+            except Exception as e:
+                # 捕获熔断信号，执行自动清Cookie并在同页码满血复活
+                if "ABORT:" in str(e):
+                    print(f"\n🚨 [Anti-Ban] IP soft-blocked on attempt {total_attempts}. Executing MELTDOWN RECOVERY...")
+                    self._recover_meltdown(keyword, total_attempts)
+                    # 恢复后重置 limiter，避免再次立刻进入高处罚
+                    try: self.limiter.current_base = self.limiter.default_base
+                    except: pass
+                    # 修正页码计数器，确保重试当前页不在打印时串号
+                    total_attempts -= 1
+                    continue # 重新执行对该页的抓取
+                else:
+                    raise e
             
             # Logic: If batch has items, it counts as a page.
             # We yield both the data AND any NEW prefixes found during this page
@@ -286,6 +253,110 @@ class NMPAScraper:
             if not self.go_to_next_page():
                 print("[Scraper] No more pages.")
                 break
+
+    def _read_pagination_info(self):
+        """读取分页栏的 '共 XX 条' 和总页数，存入实例属性供 main.py 使用"""
+        import re as _re
+        self.last_total_records = 0
+        self.last_total_pages = 0
+        try:
+            # Element UI 分页组件通常有 .el-pagination__total 显示 '共 52969 条'
+            total_el = self.page.locator(".el-pagination__total, span.el-pagination__total").first
+            if total_el.count() > 0:
+                total_text = total_el.inner_text()  # e.g. '共 52969 条'
+                match = _re.search(r'(\d+)', total_text.replace(',', '').replace(' ', ''))
+                if match:
+                    self.last_total_records = int(match.group(1))
+                    # 每页10条，计算总页数
+                    self.last_total_pages = (self.last_total_records + 9) // 10
+                    print(f"[Scraper] 📊 Total records on site: {self.last_total_records} ({self.last_total_pages} pages)")
+        except Exception as e:
+            print(f"[Scraper] Could not read pagination info: {e}")
+
+    def _recover_meltdown(self, keyword, target_page):
+        """
+        Recover from a hard block:
+        1. Clear cookies
+        2. Close extra tabs
+        3. Navigate to base URL, pick category, search again
+        4. Jump/fast-forward to target_page
+        """
+        print(f"\n[🔥 MELTDOWN] Initiating 120s deep sleep and Cookie reset...")
+        try: self.context.clear_cookies()
+        except: pass
+        
+        # Deep sleep to cool down IP
+        time.sleep(120)
+        
+        # Close extra tabs
+        while len(self.context.pages) > 1:
+            try: self.context.pages[-1].close()
+            except: pass
+        
+        if len(self.context.pages) > 0:
+            self.page = self.context.pages[0]
+            self.page.bring_to_front()
+        
+        print(f"[🔥 MELTDOWN] Restarting search for '{keyword}'...")
+        try:
+            self.page.goto(BASE_URL, timeout=60000)
+            self.page.wait_for_load_state("networkidle")
+        except:
+            self.page.reload()
+            
+        self._close_overlays()
+        time.sleep(1)
+        
+        # Category
+        category_target = "医疗器械经营企业（备案）"
+        try:
+            self.page.click('input[placeholder="请选择"]', timeout=3000)
+            time.sleep(1)
+            self.page.locator(f".el-select-dropdown__item:has-text('{category_target}')").filter(has=self.page.locator(":visible")).first.click(timeout=5000)
+            time.sleep(1)
+        except: pass
+        
+        # Search
+        try:
+            input_locator = self.page.locator('input[placeholder*="企业名称"]')
+            if input_locator.count() > 0:
+                input_locator.fill(keyword)
+                time.sleep(0.5)
+                self.page.keyboard.press("End")
+                self.page.keyboard.press("Space")
+                self.page.keyboard.press("Backspace")
+                time.sleep(0.5)
+                self.page.keyboard.press("Enter")
+        except: pass
+        
+        print(f"[🔥 MELTDOWN] Waiting for initial results...")
+        time.sleep(5)
+        
+        # Jump or Fast-Forward
+        if target_page > 1:
+            print(f"[🔥 MELTDOWN] Fast-forwarding back to page {target_page}...")
+            
+            # Attempt direct jump if jump input exists
+            jump_input = self.page.locator("span.el-pagination__jump input").first
+            if jump_input.count() > 0 and jump_input.is_visible():
+                try:
+                    jump_input.fill(str(target_page))
+                    time.sleep(0.5)
+                    jump_input.press("Enter")
+                    print(f"[🔥 MELTDOWN] Triggered direct pagination jump to page {target_page}.")
+                    time.sleep(3)
+                    return
+                except:
+                    print(f"[🔥 MELTDOWN] Direct jump failed. Falling back to next clicking...")
+                    
+            # Fallback to next clicking
+            for p in range(1, target_page):
+                if p % 10 == 0:
+                    print(f"[🔥 MELTDOWN] Fast-forward progress: {p}/{target_page}...")
+                if not self.go_to_next_page():
+                    break
+                time.sleep(1.5)
+        print(f"[🔥 MELTDOWN] Recovery complete. Resuming scraping.")
 
     def _close_overlays(self):
         """Attempt to close known overlays/popups."""
@@ -307,19 +378,9 @@ class NMPAScraper:
         items = []
         try:
             # 1. WAIT FOR DATA (Crucial: AJAX might be slow)
-            print("[Scraper] Waiting for table data to render...")
-            try:
-                # Wait for EITHER a Details button OR just table rows (fallback)
-                try:
-                    self.page.wait_for_selector("text='详情'", timeout=10000)
-                except:
-                    # If no 'Details' text found, maybe just wait for rows (Global Search might behave differently)
-                    self.page.wait_for_selector(".el-table__row", timeout=5000)
-                
-                time.sleep(1) # Extra settle time
-            except:
-                print("[Scraper] Wait timeout. Page might be empty or loading very slowly.")
-                return []
+            # 🔧 FIX: 不再用 wait_for_selector —— 已确认会破坏 Vue 状态
+            # 用 time.sleep 替代，等待数据渲染
+            time.sleep(2)
 
             # 2. Find all potential rows
             rows = self.page.locator("tr").all()
@@ -333,30 +394,38 @@ class NMPAScraper:
             
             for i, row in enumerate(rows):
                 
-                # Scroll to row to ensure elements are lazy-loaded/visible
-                try: row.scroll_into_view_if_needed()
-                except: pass
+                # 不再滚动（已确认会干扰 Vue 状态）
 
                 # Capture Base Info
                 base_info = {}
                 try:
                     cols = row.locator("td").all()
                     if len(cols) >= 3:
-                        lic_text = cols[1].inner_text().strip()
+                        # 0序号, 1编号, 2企业名称
+                        lic_text = cols[1].inner_text().strip().replace(" ", "").replace("\t", "").replace("\n", "")
                         base_info['licenseNum'] = lic_text
-                        base_info['entName'] = cols[2].inner_text().strip()
+                        
+                        ent_name = cols[2].inner_text().strip().replace(" ", "").replace("\t", "").replace("\n", "")
+                        base_info['entName'] = ent_name
                         
                         # DYNAMIC KEYWORD HARVESTING (User Request)
                         # Extract the regulator identifier (e.g. 京朝食药监械经营备案)
                         # Harvesting happens for ALL rows, even duplicates, to build the full discovery map.
                         if lic_text:
-                            # Use regex to find the first sequence of digits (usually the year) and take everything before it
-                            prefix_match = re.search(r'^(\D+)', lic_text)
+                            # 🔧 改进正则：匹配到括号或数字就停止
+                            # 例如：银审服械备字〈2020〉 → 银审服械备字
+                            prefix_match = re.search(r'^([^0-9()（）〈〉﹝﹞\[\]【】<>《》]+)', lic_text)
                             if prefix_match:
                                 prefix = prefix_match.group(1).strip()
-                                # Common noise removal: stop at '2', '1' or '号' if greedy
+                                # 🔧 FIX: 去除所有空格 (例如 "粤江 食药监械经营备" -> "粤江食药监械经营备")
+                                # 🔧 FIX: 去除偶尔出现的 "备案号：" 前缀 (爬虫有时会误把标签抓进来)
+                                prefix = prefix.replace(" ", "").replace("\t", "").replace("\n", "") \
+                                               .replace("备案号", "").replace("：", "").replace(":", "")
+                                
+                                # 去掉可能残留的年份部分
                                 prefix = re.split(r'20\d\d|20[012]\d', prefix)[0].strip()
-                                if len(prefix) > 1:
+                                # 🔧 最终验证：长度>1 且 不含特殊字符
+                                if len(prefix) > 1 and prefix.replace('药监械经营备', '').replace('食', '').replace('市监械经营备', ''):
                                     self.current_discovered.add(prefix)
                 except: pass
 
@@ -415,24 +484,11 @@ class NMPAScraper:
                             print(f"[Scraper] Row {i}: Opening '{base_info.get('entName', 'Unknown')}'...")
                             
                             detail_page = None
-                            try: btn.scroll_into_view_if_needed(timeout=2000)
-                            except: pass
-                            
-                            box = btn.bounding_box()
-                            if box:
-                                center_x = box['x'] + box['width'] / 2
-                                center_y = box['y'] + box['height'] / 2
-                                # Hardware Click Emulation
-                                self.page.mouse.move(center_x - 5, center_y - 5)
-                                time.sleep(random.uniform(0.2, 0.4))
-                                self.page.mouse.move(center_x, center_y)
-                                time.sleep(random.uniform(0.3, 0.6))
-                                with self.context.expect_page(timeout=10000) as new_page_info:
-                                    self.page.mouse.click(center_x, center_y)
-                                detail_page = new_page_info.value
-                            else:
-                                btn.click()
-                                time.sleep(2)
+                            # 🔧 FIX: 不再用硬件鼠标模拟 —— 已确认会导致详情页白屏
+                            # 也不再用 scroll_into_view —— 已确认会干扰 Vue 状态
+                            with self.context.expect_page(timeout=10000) as new_page_info:
+                                btn.click(force=True)
+                            detail_page = new_page_info.value
                             
                             if not detail_page and len(self.context.pages) > initial_page_count:
                                 detail_page = self.context.pages[-1]
@@ -442,46 +498,88 @@ class NMPAScraper:
                                     detail_page.bring_to_front()
                                     detail_page.wait_for_load_state("domcontentloaded")
                                     
-                                    # Content Polling
+                                    # 🔧 FIX: 柔性等待，模仿测试脚本的前置缓冲
+                                    time.sleep(2.0)
+                                    
+                                    # Content Polling (渐进式重试 10秒)
                                     data_ready = False
                                     for _ in range(20):
                                         try:
+                                            # 使用更严格的数据判定（只看<tr>数量不够，需要检查是否有实质文本）
                                             if detail_page.locator("tr").count() > 5:
+                                                # 🔧 响应架构师审计：采用“白名单特征确认”替代“黑名单排除法”
                                                 has_val = detail_page.evaluate("""() => {
-                                                    const divs = Array.from(document.querySelectorAll('td .cell div'));
-                                                    const ignore = ["编号", "企业名称", "法定代表人", "企业负责人", "住所", "经营场所", "经营方式", "经营范围", "库房地址", "备案部门", "备案日期"];
-                                                    return divs.some(d => d.innerText.trim().length > 1 && !ignore.includes(d.innerText.trim()));
+                                                    const rows = Array.from(document.querySelectorAll('tr'));
+                                                    for (let row of rows) {
+                                                        const cells = row.querySelectorAll('td');
+                                                        if (cells.length >= 2) {
+                                                            const label = cells[0].innerText.trim();
+                                                            const value = cells[1].innerText.trim();
+                                                            // 🔧 FIX: 增加脏数据过滤，防止 Vue 吐出 "无" 或 "******" 被当做正常数据
+                                                            if ((label.includes("名称") || label.includes("代表人") || label.includes("范围") || label.includes("方式") || label.includes("部门")) && value.length > 2) {
+                                                                // 排除无意义的高频空值
+                                                                if (!value.includes("无") && !value.includes("***")) {
+                                                                    return true;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    return false;
                                                 }""")
                                                 if has_val: data_ready = True; break
                                         except: pass
                                         time.sleep(0.5)
                                     
-                                    # Persistent Reload Strategy with Randomized Backoff (Smart Limiter)
+                                    # Persistent Reload Strategy -> Changed to "Close & Re-Click"
                                     reload_attempts = 0
                                     while not data_ready and reload_attempts < 7:
                                         reload_attempts += 1
                                         
-                                        # Tell the brain we failed
-                                        if reload_attempts == 1: self.limiter.record_block()
+                                        # Tell the brain we failed (延迟到第 3 次连败才判定为真・封锁)
+                                        if reload_attempts == 3: self.limiter.record_block()
                                         
-                                        # Get adaptive wait time (Base + Increments)
+                                        # 🔧 FIX: 恢复用户要求的原版长时惩罚（才能越过防火墙拦截期）
                                         wait_time = self.limiter.get_backoff_wait(reload_attempts)
+                                        print(f"[SmartLimiter] BLANK page! Penalty Base: {self.limiter.current_base:.1f}s. Waiting {wait_time:.1f}s (Attempt {reload_attempts}/7)...")
                                         
-                                        print(f"[SmartLimiter] BLANK page! Penalty Base: {self.limiter.current_base:.1f}s. Waiting {wait_time:.2f}s (Attempt {reload_attempts}/7)...")
-                                        time.sleep(wait_time) 
+                                        try: detail_page.close()
+                                        except: pass
+                                        time.sleep(wait_time)
                                         
                                         try:
-                                            detail_page.reload(timeout=60000)
+                                            # 用回原来的按钮去点击
+                                            print(f"[Scraper] Re-clicking details button...")
+                                            with self.context.expect_page(timeout=10000) as re_page_info:
+                                                btn.click(force=True)
+                                            detail_page = re_page_info.value
+                                            detail_page.bring_to_front()
                                             detail_page.wait_for_load_state("domcontentloaded")
-                                            time.sleep(3)
-                                            # Re-check data
-                                            for _ in range(10):
+                                            time.sleep(1.0) # 缩减重新点开的无谓等待
+
+                                            
+                                            # Re-check data (渐进式重试 10秒)
+                                            for _ in range(20):
                                                 if detail_page.locator("tr").count() > 5:
-                                                    data_ready = True
-                                                    break
+                                                    has_val = detail_page.evaluate("""() => {
+                                                        const rows = Array.from(document.querySelectorAll('tr'));
+                                                        for (let row of rows) {
+                                                            const cells = row.querySelectorAll('td');
+                                                            if (cells.length >= 2) {
+                                                                const label = cells[0].innerText.trim();
+                                                                const value = cells[1].innerText.trim();
+                                                                if ((label.includes("名称") || label.includes("代表人") || label.includes("范围") || label.includes("方式") || label.includes("部门")) && value.length > 2) {
+                                                                    if (!value.includes("无") && !value.includes("***")) {
+                                                                        return true;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        return false;
+                                                    }""")
+                                                    if has_val: data_ready = True; break
                                                 time.sleep(0.5)
                                         except Exception as e_rel:
-                                            print(f"[Warning] Reload attempt {reload_attempts} failed: {e_rel}")
+                                            print(f"[Warning] Re-click attempt {reload_attempts} failed: {e_rel}")
 
                                     if not data_ready:
                                         print(f"[CRITICAL] Still BLANK after {reload_attempts} attempts (~10 mins).")
@@ -489,11 +587,15 @@ class NMPAScraper:
                                         self.save_failure_artifacts(detail_page, f"Ban_{base_info.get('entName', 'Unknown')}")
                                         raise Exception("ABORT: Consistent blank pages detected. Please check IP status or website availability.")
 
+
                                     # Extraction
                                     detail_item = self._extract_detail_fields(detail_page)
                                     
                                     if not detail_item:
-                                        print(f"[Scraper] Extraction failed (Incomplete data) for: {base_info.get('entName')}. Retrying or skipping...")
+                                        print(f"[Scraper] Extraction failed (Incomplete data) for: {base_info.get('entName')}. Fast Retrying...")
+                                        try: detail_page.close()
+                                        except: pass
+                                        time.sleep(1.0) # 仅需短暂缓冲，快速重开刷新 Vue 状态
                                         continue # Go to next attempt for this row
 
                                     # Use DETAIL page data as authoritative (has full names, not truncated)
@@ -509,8 +611,11 @@ class NMPAScraper:
                                     if detail_item.get('entName'):
                                         final_item['entName'] = detail_item['entName']
                                     
-                                    # Double Check: Ensure we have a REAL detail field
-                                    if final_item.get('legalRep') or final_item.get('resPerson') or final_item.get('opMode'):
+                                    # Double Check: Ensure we have a REAL detail payload (Defend against silent WAF packet drop)
+                                    # 要求至少存在法人、负责人或经营方式中任意一项，且非极短无效字符
+                                    def is_valid(val): return bool(val and len(str(val).strip()) > 1 and str(val).strip() not in ("无", "***", "暂无", "空"))
+                                    
+                                    if is_valid(final_item.get('legalRep')) or is_valid(final_item.get('resPerson')) or is_valid(final_item.get('opMode')):
                                         items.append(final_item)
                                         # Update Dedupe Set immediately to prevent re-scraping in same session
                                         if final_item.get('licenseNum'):
@@ -523,12 +628,12 @@ class NMPAScraper:
                                         self.limiter.record_success()
                                         detail_success = True
                                     else:
-                                        print(f"[Warning] Record for {final_item['entName']} filtered out: No detail fields extracted.")
-                                        self._log_failure(base_info, "Empty Detail Fields (Zero Payload)")
+                                        print(f"[Warning] Record for {final_item['entName']} filtered out: Empty Detail Fields (Zero Payload or Invalid).")
+                                        self._log_failure(base_info, "Empty Detail payload dropped")
                                     
-                                    # Adaptive Sleep
-                                    sleep_time = self.limiter.get_delay()
-                                    print(f"[SmartLimiter] Resting for {sleep_time:.2f}s...")
+                                    # 🔧 FIX: 拉长拟人化休眠，增大方差防脚本检测
+                                    sleep_time = random.uniform(2.5, 4.5)
+                                    print(f"[BurstScraping] Resting for {sleep_time:.2f}s...")
                                     time.sleep(sleep_time)
                                     break
                                     
@@ -543,13 +648,20 @@ class NMPAScraper:
                                 print(f"[Detail Retry {attempt+1}/3] No tab found.")
                         except Exception as e:
                             print(f"[Detail Retry {attempt+1}/3] Error: {e}")
+                            # 🚨 致命修复：如果是 IP 封锁引起的持续白屏（ABORT异常），必须向上抛出
+                            if "ABORT:" in str(e):
+                                raise e
                             time.sleep(2)
                     
                     if not detail_success and base_info.get('entName'):
                         print(f"[Scraper] Failed details for: {base_info['entName']}. Item will NOT be saved to avoid ghost records.")
                         self._log_failure(base_info, "Extraction Failed / Closed unexpectedly")
+# -------------------------------------------------------------
         except Exception as e:
             print(f"[Scraper] detail loop failure: {e}")
+            # 🚨 致命修复：如果是 IP 封锁引起的持续白屏（ABORT异常），必须向上抛出，阻断整个爬虫！
+            if "ABORT:" in str(e):
+                raise e
         return items
 
     def _extract_detail_fields(self, page):
@@ -568,7 +680,7 @@ class NMPAScraper:
                 key_map = {
                     "编号": "licenseNum", "企业名称": "entName", "法定代表人": "legalRep",
                     "企业负责人": "resPerson", "住所": "entAddress", "经营场所": "opAddress",
-                    "经营方式": "opMode", "经营范围": "scope", "库房地址": "warehouseAddr",
+                    "经营方式": "opMode", "经营范围": "scope", 
                     "备案部门": "filingDept", "备案日期": "filingDate"
                 }
                 
@@ -597,6 +709,18 @@ class NMPAScraper:
                                     val = ""
                                 # 4. 只要包含*就不存
                                 elif "*" in val:
+                                    val = ""
+
+                            # 🧹 数据清洗：过滤无效的地址 (新增请求)
+                            # 已移除 warehouseAddr (库房地址)，不再采集
+                            if field_key in ("entAddress", "opAddress"):
+                                invalid_addr = {"无", "无此项", "暂无", "无数据", "不适用", "未填写", "-", "/", "//", "\\", "——", "—", ".", "null", "NULL", "N/A", "n/a"}
+                                if val in invalid_addr:
+                                    val = ""
+                                # 地址如果全是星号，或者包含 "无" 且长度极短 (<4)
+                                elif set(val) == {'*'} or ( "*" in val and len(val) < 5 ): 
+                                    val = ""
+                                elif "无" in val and len(val) < 4 and "市" not in val and "县" not in val:
                                     val = ""
                             
                             item[field_key] = val
@@ -632,35 +756,58 @@ class NMPAScraper:
         except: pass
 
     def go_to_next_page(self):
-        try:
-            print("[Scraper] Attempting to go to next page...")
-            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1)
+        # 🔧 FIX: 不再吞掉异常，让调用者(main.py)知道网络中断等错误
+        # try:
+        print("[Scraper] Attempting to go to next page...")
+        
+        # Element UI standard pagination "Next" button
+        # We must ignore if it has 'disabled' attribute or class
+        next_btn = self.page.locator("button.btn-next").first
+        
+        if next_btn.count() > 0:
+            if next_btn.is_disabled() or "disabled" in next_btn.get_attribute("class"):
+                print("[Scraper] Next button is disabled. End of list.")
+                return False
             
-            # Element UI standard pagination "Next" button
-            # We must ignore if it has 'disabled' attribute or class
-            next_btn = self.page.locator("button.btn-next").first
+            # 🔧 FIX: 三重点击保障，防止超时崩溃
+            # 第1层：正常点击 (5s)
+            # 第2层：强制点击 (5s)  
+            # 第3层：JS直接触发点击事件
+            click_success = False
+            try:
+                next_btn.click(timeout=5000)
+                click_success = True
+            except Exception as e1:
+                print(f"[Scraper] Normal click failed. Trying FORCE CLICK... ({str(e1)[:50]})")
+                try:
+                    next_btn.click(force=True, timeout=5000)
+                    click_success = True
+                except Exception as e2:
+                    print(f"[Scraper] Force click also failed. Trying JS CLICK... ({str(e2)[:50]})")
+                    try:
+                        next_btn.evaluate("el => el.click()")
+                        click_success = True
+                    except Exception as e3:
+                        print(f"[Scraper] All 3 click methods failed! ({str(e3)[:50]})")
+                        raise e3  # 三种都失败，说明是真正的网络/浏览器问题
             
-            if next_btn.count() > 0:
-                if next_btn.is_disabled() or "disabled" in next_btn.get_attribute("class"):
-                    print("[Scraper] Next button is disabled. End of list.")
-                    return False
-                next_btn.click()
+            if click_success:
                 print("[Scraper] Clicked 'Next' button.")
                 return True
-            
-            # Fallback text search
-            fallback_btn = self.page.locator("li.next, button:has-text('下一页')").first
-            if fallback_btn.count() > 0 and fallback_btn.is_visible():
-                 fallback_btn.click()
-                 print("[Scraper] Clicked 'Next' (fallback).")
-                 return True
-                 
-            print("[Scraper] No 'Next' button found.")
-            return False
-        except Exception as e: 
-            print(f"[Scraper] Pagination error: {e}")
-            return False
+        
+        # Fallback text search
+        fallback_btn = self.page.locator("li.next, button:has-text('下一页')").first
+        if fallback_btn.count() > 0 and fallback_btn.is_visible():
+                fallback_btn.click()
+                print("[Scraper] Clicked 'Next' (fallback).")
+                return True
+                
+        print("[Scraper] No 'Next' button found.")
+        return False
+        # except Exception as e: 
+        #     print(f"[Scraper] Pagination error: {e}")
+        #     # 🔧 如果是超时或网络错误，应该抛出异常，而不是返回False(认为跑完)
+        #     raise e
 
     def _log_failure(self, base_info, reason):
         """Append to logs/failed_details.jsonl for manual review."""

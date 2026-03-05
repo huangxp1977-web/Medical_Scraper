@@ -26,7 +26,7 @@ BLOCKED_COOLDOWN = 70 # Legacy static value (will be superseded by Auto-Adaptive
 RL_BASE_WAIT = 2.2    # 最快速率 (Block前多抓数据)
 RL_MIN_WAIT = 2.2     # 不限速
 RL_MAX_WAIT = 120     # Slowest allowed base wait
-RL_PENALTY_ADD = 20   # Seconds to add when blocked
+RL_PENALTY_ADD = 10   # Seconds to add when blocked (由原20下降到10，因为首发已提升至30)
 RL_RECOVERY_STEP = 2  # Seconds to recover (speed up) every 10 successes
 
 # 🧪 EXPERIMENTAL: Aggressive Recovery Mode

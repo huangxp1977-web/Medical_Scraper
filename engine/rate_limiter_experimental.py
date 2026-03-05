@@ -82,11 +82,11 @@ class SmartRateLimiter:
         
         # 🧪 EXPERIMENTAL: Aggressive Recovery Mode
         if self.aggressive_recovery:
-            # 快速恢复策略：连续成功3次后立即重置到默认速度
-            if self.current_base > self.default_base and self.consecutive_success >= 3:
+            # 快速恢复策略：连续成功10次后立即重置到默认速度
+            if self.current_base > self.default_base and self.consecutive_success >= 10:
                 old_base = self.current_base
                 self.current_base = self.default_base
-                print(f"[🧪 Aggressive Recovery] 3 wins in a row! INSTANT reset: {old_base:.2f}s → {self.current_base:.2f}s")
+                print(f"[🧪 Aggressive Recovery] 10 wins in a row! INSTANT reset: {old_base:.2f}s → {self.current_base:.2f}s")
                 
                 self._log({
                     "event": "AGGRESSIVE_RESET", 
@@ -152,8 +152,11 @@ class SmartRateLimiter:
         self.blocks_today += 1
         
         old_base = self.current_base
-        # Penalty: Add seconds
-        self.current_base = min(self.max_base, self.current_base + self.penalty_add)
+        # Penalty: Add seconds (首犯直接拉到 30秒，后续以 penalty_add 步进)
+        if self.current_base < 30.0:
+            self.current_base = 30.0
+        else:
+            self.current_base = min(self.max_base, self.current_base + self.penalty_add)
         
         mode_label = "🧪 AGGRESSIVE" if self.aggressive_recovery else "GRADUAL"
         print(f"[RateLimiter {mode_label}] BLOCK DETECTED! Penalty applied.")
